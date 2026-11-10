@@ -381,8 +381,9 @@ class ArmedRetestMixin:
                 touched = extreme >= max(level - zone_atr * atr, breakout_close + zone_atr * atr)
 
         reclaimed = close > level if side == Side.LONG else close < level
-        min_close_pos = min(0.95, max(0.05, float(
-            self.params.get("armed_retest_min_close_position", 0.60))))
+        # 0.05 to 0.95, checked at load (``checked_knobs``; clamped into that
+        # range here, silently, until 2026-11-10).
+        min_close_pos = float(self.params["armed_retest_min_close_position"])
         close_pos = bar_close_position(frame)
         bar_ok = (close_pos >= min_close_pos if side == Side.LONG
                   else close_pos <= (1.0 - min_close_pos))

@@ -545,19 +545,25 @@ class TradeManager:
         # Above 0, checked at load (a 0 read as 1.0 until 2026-09-26).
         default_min_r = self.config.risk.peak_giveback_min_r
         override = meta.get("peak_giveback_min_r_override")
-        override_active = False
+        min_r, override_active = default_min_r, False
         if override is not None:
+            # A stamp that is not a finite number above 0 (a restored
+            # position's damaged record) is logged with its type and dropped
+            # from the position, so it is reported once (every pass until
+            # 2026-11-10), and the default arming holds. A NaN used to read
+            # as an override that armed the main tier at any peak.
             try:
-                min_r = float(override)
-                override_active = True
+                value = float(override)
             except (TypeError, ValueError):
+                value = math.nan
+            if isinstance(override, bool) or not math.isfinite(value) or value <= 0.0:
                 LOG.warning(
-                    "peak_giveback_min_r_override on %s (id=%s) is malformed (%r); falling back to default %.2fR",
-                    position.symbol, getattr(position, "id", "?"), override, default_min_r,
+                    "peak_giveback_min_r_override on %s (id=%s) is malformed (%r, %s); dropped, the default %.2fR arms it",
+                    position.symbol, getattr(position, "id", "?"), override, type(override).__name__, default_min_r,
                 )
-                min_r = default_min_r
-        else:
-            min_r = default_min_r
+                del meta["peak_giveback_min_r_override"]
+            else:
+                min_r, override_active = value, True
         peak_r, current_r = self._peak_and_current_r(position, last_price, initial_risk)
 
         # Low-tier check (2026-05-26). For trades that peaked between

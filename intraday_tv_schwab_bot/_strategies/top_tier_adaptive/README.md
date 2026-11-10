@@ -1126,3 +1126,53 @@ moved one more exit, on an entry the pass admitted. The figures are mostly
 in-sample: the 13:00 and 11:00 clocks were chosen on the 23 days. With the
 three knobs at their old values the same code replays 11-09 step for step as
 the code before it. The dry run is the test.
+
+## 26. Every switch this engine reads, and the review's list of numbers, are checked at load (2026-11-10)
+
+The whole-bot review's R-092 and R-079, deferred on 2026-11-08. The 10-13
+cut checked the HTF, index, leg, trailing-bias and LTF knobs
+(`checked_knobs`: `STRICT_BOOL_KNOBS`, `NUMBER_KNOBS`); everything else was
+still read where it was used:
+
+- 32 switches with `bool()`, so a quoted `"false"` read as true and silently
+  flipped a gate (`reject_*`, `require_*`, `respect_screener_bias`,
+  `atr_aware_stop_enabled`, `volatility_scaled_thresholds`,
+  `early_session_stop_widening_enabled`, the pullback / range / vol_squeeze
+  builders' own `*_require_*` and gate switches), an ORB bypass
+  (`orb_bypass_*`, `orb_require_5m_followthrough`), a regime
+  (`disable_*_regime`, `disable_orb_window`, `afternoon_include_range`), the
+  armed retest (`armed_retest_enabled`) or `extended_hours_tradable_all`;
+- 29 numbers with `float()` / `int()` at the first signal, so a quoted or
+  null value raised inside the entry pass mid-session, and a 0 or a negative
+  passed without a word.
+
+All 61 are in the two tables now, in both manifests' terms (small_cap_squeeze
+runs this engine). That is every switch the engine reads with `bool()`; of
+the numbers it is the review's list, and about 60 others (the `orb_*`
+multiples, the `side_decision_*` knobs, `stop_buffer_atr_mult`, the
+`*_target_rr`, `zone_pct`, `min_adx14`, ...) are still read where they are
+used. For the 61: a switch must be `true` or `false`, a number a finite
+number inside its bounds, and a missing one refuses, each named in the
+error, when the config loads and again when the strategy is built. The
+bounds refuse only what cannot work:
+
+| Knob | Refused | Why |
+|---|---|---|
+| the eight `min_*_score` | 0 or less | a floor of 0 qualifies every regime on every bar |
+| `armed_retest_max_minutes` | 0 or less | every arm is pruned at once, so trend and momentum never enter |
+| `armed_retest_min_close_position` | under 0.05, over 0.95 | it was clamped into that range silently; the clamp is gone |
+| `pullback_lookback_bars`, `momentum_breakout_lookback_bars` | under 3, or fractional | they were floored at 3 silently |
+| `atr_widening_max_factor` | under 1 | it would narrow every stop buffer |
+| `stretched_percent_b_max` | 0.5 or less | at or under the mid-band every read is stretched on one side or the other; past 1 is allowed, %B runs past the band |
+| `adaptive_profit_lock_rr`, `adaptive_runner_trigger_rr`, `peak_giveback_high_conviction_min_r`, the two `entry_bar_*_max_atr_mult`, `target_max_sr_ratio` | 0 or less | a lock armed at 0R exits every trade at once |
+| the rest (`min_bars` at least 1; cooldown, multiples, weights and thresholds at least 0) | a negative | |
+
+Two cross-checks. `adaptive_profit_lock_stop_rr` must be under
+`adaptive_profit_lock_rr`, or the lock would move the stop to the price that
+armed it and exit the trade on the spot. `peak_giveback_high_conviction_min_r`
+must be at least `risk.peak_giveback_min_r` (checked when the strategy is
+built): the override raises the arming, and one under the default would arm
+a conviction day's trade earlier and take the low tier away from it. A config that loaded before and
+holds one of these values now refuses to start, naming the key: that is the
+point.
+

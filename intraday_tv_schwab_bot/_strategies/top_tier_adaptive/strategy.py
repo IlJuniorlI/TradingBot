@@ -233,6 +233,41 @@ STRICT_BOOL_KNOBS = (
     "leg_anchored_confirmation",
     "trailing_bias_enabled",
     "vwap_reclaim_require_held_bucket",
+    # 2026-11-10 (the whole-bot review's R-092): every other switch this
+    # engine reads with bool(), where a quoted "false" read as true and
+    # silently flipped a gate, a bypass or a regime.
+    "reject_oversized_entry_bar",
+    "reject_stretched_entries",
+    "reject_tech_bias_contradiction",
+    "reject_target_beyond_sr",
+    "require_explicit_side_decision",
+    "require_entry_confirmation_bar",
+    "respect_screener_bias",
+    "atr_aware_stop_enabled",
+    "extended_hours_tradable_all",
+    "armed_retest_enabled",
+    "afternoon_include_range",
+    "orb_require_5m_followthrough",
+    "orb_bypass_exhaustion",
+    "orb_bypass_screener_bias",
+    "orb_bypass_side_decision",
+    "orb_bypass_relative_strength",
+    "disable_trend_regime",
+    "disable_pullback_regime",
+    "disable_range_regime",
+    "disable_vol_squeeze_regime",
+    "disable_momentum_regime",
+    "disable_sr_scalp_regime",
+    "disable_vwap_reclaim_regime",
+    "disable_orb_regime",
+    "disable_orb_window",
+    "volatility_scaled_thresholds",
+    "early_session_stop_widening_enabled",
+    "vol_squeeze_hard_breakout_gates",
+    "pullback_require_fresh_leg",
+    "pullback_require_real_dip",
+    "range_require_prev_bar_confirmation",
+    "reject_range_during_squeeze",
 )
 # (key, whole number, lowest, lowest allowed, highest, highest allowed).
 # htf_ema_alignment_score is a weight: 0 turns the term off, and a negative
@@ -258,6 +293,49 @@ NUMBER_KNOBS = (
     # The trend-day pass (2026-11-10, ``_trend_day_pass``): the sector's day
     # strength toward the trade, in percent, from which it applies; 0 = off.
     ("trend_day_pass_sector_pct", False, 0.0, True, None, True),
+    # 2026-11-10 (the whole-bot review's R-092 and R-079): the numbers this
+    # engine read with float() / int() at the first signal, where a quoted
+    # or null value raised inside the entry pass mid-session and a 0 or a
+    # negative passed silently. The bounds refuse only what cannot work: a
+    # regime floor of 0 qualifies every regime on every bar; a wait of 0
+    # minutes prunes every arm, so trend and momentum never enter; a lock
+    # armed at 0R exits every trade at once; a widening cap under 1 narrows
+    # every stop buffer; a %B limit at or under the mid-band calls every
+    # read stretched on one side or the other (it may sit past 1: %B runs
+    # past the upper band). The two lookbacks were floored at 3 and the
+    # close position clamped into 0.05..0.95, silently. These are the
+    # review's lists, not every number the engine reads: the orb_*
+    # multiples, the side_decision_* knobs, stop_buffer_atr_mult, the
+    # *_target_rr and others are still read where they are used.
+    ("min_bars", True, 1, True, None, True),
+    ("pullback_lookback_bars", True, 3, True, None, True),
+    ("momentum_breakout_lookback_bars", True, 3, True, None, True),
+    ("entry_bar_range_max_atr_mult", False, 0.0, False, None, True),
+    ("entry_bar_body_max_atr_mult", False, 0.0, False, None, True),
+    ("stretched_cooldown_minutes", False, 0.0, True, None, True),
+    ("stretched_percent_b_max", False, 0.5, False, None, True),
+    ("stretched_atr_mult_max", False, 0.0, True, None, True),
+    ("orb_opposing_sr_atr_mult", False, 0.0, True, None, True),
+    ("target_max_sr_ratio", False, 0.0, False, None, True),
+    ("activity_score_weight", False, 0.0, True, None, True),
+    ("min_trend_score", False, 0.0, False, None, True),
+    ("min_pullback_score", False, 0.0, False, None, True),
+    ("min_range_score", False, 0.0, False, None, True),
+    ("min_vol_squeeze_score", False, 0.0, False, None, True),
+    ("min_momentum_score", False, 0.0, False, None, True),
+    ("min_sr_scalp_score", False, 0.0, False, None, True),
+    ("min_orb_score", False, 0.0, False, None, True),
+    ("min_vwap_reclaim_score", False, 0.0, False, None, True),
+    ("peak_giveback_high_conviction_day_strength_pct", False, 0.0, True, None, True),
+    ("peak_giveback_high_conviction_min_r", False, 0.0, False, None, True),
+    ("armed_retest_max_minutes", False, 0.0, False, None, True),
+    ("armed_retest_zone_atr", False, 0.0, True, None, True),
+    ("armed_retest_min_close_position", False, 0.05, True, 0.95, True),
+    ("armed_retest_invalidation_atr", False, 0.0, True, None, True),
+    ("atr_widening_max_factor", False, 1.0, True, None, True),
+    ("adaptive_profit_lock_rr", False, 0.0, False, None, True),
+    ("adaptive_profit_lock_stop_rr", False, 0.0, True, None, True),
+    ("adaptive_runner_trigger_rr", False, 0.0, False, None, True),
 )
 # As NUMBER_KNOBS, and null is allowed too: the breakeven tier's arm, which
 # null turns off (2026-11-07; BaseStrategy._adaptive_management_components
@@ -286,8 +364,8 @@ def checked_knobs(params: Mapping[str, Any], strategy_name: str) -> None:
     that is not a finite number in its bounds (a whole number where it
     counts bars; one of ``NULLABLE_NUMBER_KNOBS`` may be null too), one of
     ``TIME_KNOBS`` that is not an HH:MM time, a
-    missing one of any, and a bad ``require_htf_ema_alignment`` mode or
-    LTF / HTF EMA span pair. The load runs it on the params of every
+    missing one of any, a profit lock whose stop is not under its arming, and
+    a bad ``require_htf_ema_alignment`` mode or LTF / HTF EMA span pair. The load runs it on the params of every
     strategy a config sets (``normalize_params``), and the strategy again
     when it is built."""
     for key in STRICT_BOOL_KNOBS:
@@ -318,6 +396,14 @@ def checked_knobs(params: Mapping[str, Any], strategy_name: str) -> None:
                 bounds.append(f"{'<=' if high_ok else '<'} {high}")
             raise ValueError(f"strategies.{strategy_name}.params.{key} must be {kind}"
                              f"{' ' + ' and '.join(bounds) if bounds else ''}, got {value!r}")
+    # The profit lock moves the stop to ``adaptive_profit_lock_stop_rr`` once
+    # the trade has reached ``adaptive_profit_lock_rr``: a stop at or past
+    # the arming price would exit the trade the moment the lock armed
+    # (R-079).
+    if params["adaptive_profit_lock_stop_rr"] >= params["adaptive_profit_lock_rr"]:
+        raise ValueError(
+            f"strategies.{strategy_name}.params.adaptive_profit_lock_stop_rr must be under adaptive_profit_lock_rr "
+            f"({params['adaptive_profit_lock_rr']!r}), got {params['adaptive_profit_lock_stop_rr']!r}")
     for key in TIME_KNOBS:
         if key not in params:
             raise ValueError(f"strategies.{strategy_name}.params.{key} is missing: the strategy's manifest declares it")
@@ -440,6 +526,16 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         self._protective_exits_on_executable_side = protective_exits_knob(
             self.params, self.strategy_name, allowed=self.protective_exits_on_book_allowed)
         checked_knobs(self.params, self.strategy_name)
+        # The high-conviction override RAISES the giveback's arming. One
+        # under the default arming would arm the main tier earlier on a
+        # conviction day and take the low tier away from it: refused here,
+        # where the risk section is in reach (2026-11-10).
+        override_min_r = self.params["peak_giveback_high_conviction_min_r"]
+        default_min_r = config.risk.peak_giveback_min_r
+        if override_min_r < default_min_r:
+            raise ValueError(
+                f"strategies.{self.strategy_name}.params.peak_giveback_high_conviction_min_r must be at least "
+                f"risk.peak_giveback_min_r ({default_min_r!r}), got {override_min_r!r}")
         # Per symbol, the state of its stored HTF frame the gates last read
         # (``_htf_frame_refusal``: fresh, stale or missing), so a change is
         # logged once rather than every pass.
