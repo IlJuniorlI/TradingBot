@@ -645,11 +645,16 @@ strategies:
     # If you turn the ORB regime back on, 09:30 -> 09:30 + orb_range_minutes
     # (09:45) is a no-entry zone again regardless of this window, so an
     # earlier start here is harmless but inert until range-end. Entries stop
-    # at no_new_entries_after (15:00). Management runs to 15:55 (force-flatten
+    # at 13:00 (2026-11-10; 15:00 until then), here and at
+    # no_new_entries_after: on 31 replayed days (23 from 10-01..11-09, 8
+    # held-out September days) the 13 entries from 13:00 on had 2 winners
+    # and lost 7.89R, in every sample. Open positions are managed as before.
+    # Management runs to 15:55 (force-flatten
     # ~15:50 = mgmt end - force_flatten_buffer_minutes); the screener runs the
-    # full session so candidates are ready when entries open.
+    # full session so candidates are ready when entries open and the
+    # afternoon's watchlist bars keep being archived for a later re-test.
     entry_windows:
-      - ["09:35", "15:00"]
+      - ["09:35", "13:00"]
     management_windows:
       - ["09:30", "15:55"]
     screener_windows:
@@ -934,13 +939,17 @@ strategies:
       # NOTE: orb_end_time and the orb_* block below are INERT while
       # disable_orb_regime is true — no opening range forms, there is no
       # ORB-only window, and _in_orb_window() is always False (so none of the
-      # orb_bypass_* relaxations ever apply). They are kept, not deleted, so
-      # flipping disable_orb_regime back to false restores a tuned regime.
+      # orb_bypass_* relaxations ever apply). They are kept, not deleted, but
+      # flipping disable_orb_regime back to false does NOT restore a working
+      # regime (2026-11-10; see orb_max_range_atr_mult below).
       orb_end_time: "10:05"
       midday_start_time: "11:30"
       midday_end_time: "13:00"
       afternoon_start_time: "13:00"
-      no_new_entries_after: "15:00"
+      # 2026-11-10: 13:00 (15:00 until then), with entry_windows above. The
+      # afternoon window (afternoon_start_time -> here) is empty while the
+      # two are equal; raise both to trade the afternoon again.
+      no_new_entries_after: "13:00"
 
       # --- Opening Range Breakout (ORB) regime (2026-05-29) — CURRENTLY OFF ---
       # Everything in this block is inert while disable_orb_regime is true.
@@ -960,6 +969,14 @@ strategies:
       orb_breakout_buffer_atr_mult: 0.022   # break must clear the edge by this x ATR (not a 1-tick poke); was 0.05
       orb_target_range_mult: 1.5            # measured-move target = range height x this
       orb_min_range_atr_mult: 0.22          # reject ranges tighter than this x ATR (noise breaks); was 0.5
+      # This cap refuses every break (the strategy README, section 23, open
+      # since 2026-09-22: a 15-minute range is 2.7 to 6 x the 5m ATR, never
+      # under 1.74). Replayed 2026-11-10 on 23 archived days (10-01..11-09):
+      # as set, the regime took no trade (334 of 575 symbol-days scored a
+      # break, all refused) and only held the other regimes back to
+      # orb_end_time (-3.25R); with the cap off (0) it took 118 trades, 38%
+      # winners, -12.51R (shorts -15.19R). Widening the cap alone is not a
+      # fix. Left as is while the regime stays off.
       orb_max_range_atr_mult: 1.74          # reject ranges wider than this x ATR (untradeable); 0 disables the cap; was 4.0
       min_orb_score: 3.5                    # regime-score floor (base 0.5 + break 2.5 + conviction/range bonuses)
 
@@ -1132,6 +1149,23 @@ strategies:
       armed_retest_min_close_position: 0.60 # reclaim bar must close in the top 40% of its range (mirror for SHORT)
       armed_retest_invalidation_atr: 0.33   # a close this far back through the level kills the arm
 
+      # ===== Trend-day pass (2026-11-10) =====
+      # On a morning the symbol's sector ETF already runs the trade's way by
+      # trend_day_pass_sector_pct percent from its open, an entry whose armed
+      # retest has resolved (the confirmed retest, or the held expiry's
+      # market entry) is not refused by three anti-chase gates: the
+      # stretched check and its cooldown, the S/R veto's HTF clearance
+      # (too_close_to_htf_resistance / _support) and the exhaustion check's
+      # VWAP extension. Every other gate judges it as ever. Before
+      # trend_day_pass_until only: on the replayed days (23 from
+      # 10-01..11-09, 8 held-out September days) the pass admitted 33
+      # entries before 11:00, 18 winners, +11.69R, and 83 from 11:00 on at
+      # -6.75R. The held-out support is thin (8 entries, the gain on one
+      # day). An entry it admitted carries gate_trend_day_pass and the
+      # refusals it waived (gate_trend_day_pass_waived). 0 turns it off.
+      trend_day_pass_sector_pct: 1.5
+      trend_day_pass_until: "11:00"
+
       # Stretched entry filter: reject LONG at pct_b ≥ threshold AND
       # atr_stretch ≥ threshold (mirror for SHORT at pct_b ≤ 1-threshold).
       reject_stretched_entries: true
@@ -1158,6 +1192,8 @@ strategies:
       require_htf_pivot_alignment_trend: true
 
       # Afternoon: include range regime (mean-reversion on range-bound tapes).
+      # Inert while no_new_entries_after is 13:00 (2026-11-10): there is no
+      # afternoon window.
       afternoon_include_range: true
 
       # Target-inside-SR (CEILING): reject trend entries whose target
@@ -1299,7 +1335,8 @@ strategies:
       # box (range_pct + bb_width_pct both compressed) AND the current bar
       # breaks out of the box with confirming volume. Allowed in the
       # primary window (orb_end -> midday_start), midday (added 2026-09-21)
-      # and the afternoon (13:00 -> no_new). Set
+      # and the afternoon (13:00 -> no_new; empty while no_new_entries_after
+      # is 13:00, 2026-11-10). Set
       # `disable_vol_squeeze_regime: true` to opt out.
       #
       # 2026-05-14 tightening: session 14 entries, 3W/8L (27% wr), +$9.58
@@ -1612,8 +1649,11 @@ strategies:
       #    enabled. With the regime off, `_in_orb_window` is always False and
       #    every entry runs under full HTF-bias / structure / S/R /
       #    exhaustion / side-decision / relative-strength gating.
-      # NOTE: thin evidence — one session. Flip back to `false` to restore
-      # the ORB regime and its window.
+      # NOTE: thin evidence — one session. Since 2026-11-10 there is more:
+      # replayed on 23 archived days the regime as set takes no trade
+      # (orb_max_range_atr_mult refuses every break) and with that cap off it
+      # loses 12.51R on 118 trades. `false` switches the window and its
+      # bypasses back on, not a regime that works.
       disable_orb_regime: true
 
       # --- vwap_reclaim (enabled 2026-09-18) -----------------------------
@@ -1757,6 +1797,14 @@ strategies:
       # without the stamp (other strategies, non-conviction trades).
       peak_giveback_high_conviction_day_strength_pct: 2.5  # HIGH_VOL: was 2.0 — 2% is common in high vol; require 2.5% for true trend-day conviction; read toward the trade since 2026-11-08 (a counter-day entry gets the default)
       peak_giveback_high_conviction_min_r: 2.5             # HIGH_VOL: was 2.0 — let conviction trades retrace from 2.5R peak (more runway)
+      # 2026-11-10, the override's bridge. The override left a trade that
+      # peaked between risk.peak_giveback_min_r (1.25R) and the 2.5R above
+      # with no giveback floor at all: it fell back to the profit lock. With
+      # the bridge such a peak exits once the trade is back to this fraction
+      # of it (peak_giveback_bridge:...). On 23 replayed days it moved 4
+      # exits from 0.33R-0.50R to 0.78R-1.08R and worsened none. 0 = no
+      # bridge.
+      peak_giveback_high_conviction_bridge_retain: 0.5
 
       # Confirmation groups (the concentration guard reads correlation_groups
       # below, not these). Group membership drives two things: which ETF a symbol falls back to

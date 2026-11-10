@@ -127,3 +127,11 @@ No other preset value changed. Three fixes and two manifest exemptions change wh
 - Every preset's `peak_giveback_*` comment described the tiers before 2026-05-27 ("50% at 1R-2R, 40% at 2R-3R, 30% at 3R+"). The presets that do not set `peak_giveback_retain_*` run the code defaults, a floor that keeps 65% / 72% / 78% of a 1R-2R / 2R-3R / 3R+ peak; `top_tier_adaptive` sets the same three and `small_cap_squeeze` 60% / 70% / 78%. No value moved.
 - `peak_giveback_enabled: false` is the off switch (the low tier with it); `peak_giveback_min_r` must be above 0 and is refused at load otherwise.
 - `small_cap_squeeze`'s comment no longer says peak giveback owns the runner: with the 5% day-strength override on most entries it applies only above 2.5R, and break-even at 1.2R, the profit lock at 1.8R (to +1.0R) and, without a ladder rung, the 5% trail manage the trade below that.
+
+## top_tier_adaptive: entries to 13:00, the trend-day pass, the override's bridge (2026-11-10)
+
+- `entry_windows` ends at `13:00` and `no_new_entries_after` is `13:00` (both `15:00` until then). On 31 replayed days the 13 entries from 13:00 on had 2 winners and lost 7.89R. Management still runs to 15:55 and the screener to 15:00. Raise both values to trade the afternoon again.
+- `trend_day_pass_sector_pct: 1.5` and `trend_day_pass_until: "11:00"` switch the trend-day pass on (the manifests declare `0.0`, off). `peak_giveback_high_conviction_bridge_retain: 0.5` switches the override's bridge on (the manifests declare `0.0`). `small_cap_squeeze` sets neither and runs with both off.
+- The `orb_*` comments no longer say that `disable_orb_regime: false` restores a tuned regime: as set it takes no trade (`orb_max_range_atr_mult`), and with that cap off it lost 12.51R on 118 replayed trades. The values are unchanged.
+- The evidence and its limits are in the strategy README, section 25.
+

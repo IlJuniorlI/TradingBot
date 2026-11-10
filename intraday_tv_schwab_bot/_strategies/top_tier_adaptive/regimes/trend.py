@@ -53,7 +53,8 @@ class TrendRegimeMixin:
     def _build_trend_signal(self, c: Candidate, side: Side, close: float, atr: float,
                             ltf: pd.DataFrame, frame: pd.DataFrame, regime_score: float,
                             data=None, vol_widening: float = 1.0, vol_scale: float = 1.0,
-                            breakout_confirmed: bool = False) -> Signal | None:
+                            breakout_confirmed: bool = False,
+                            trend_day_pass: str | None = None) -> Signal | None:
         """The latest 1m close must clear the last ``pullback_lookback_bars``
         closed LTF buckets' high (LONG; low for a SHORT,
         ``_breakout_reference``). The stop goes beyond those buckets' low by
@@ -62,6 +63,8 @@ class TrendRegimeMixin:
 
         ``breakout_confirmed`` is set by an armed retest: a CONFIRMED retest,
         or an expired arm whose breakout still holds (the market fallback).
+        ``trend_day_pass`` is such an entry's trend-day pass, handed on to
+        ``_finalize_signal``, which documents it.
 
         The fresh-breakout gate below asks "is close above the last N bars'
         high". On a retest cycle that window still holds the breakout bar,
@@ -108,4 +111,5 @@ class TrendRegimeMixin:
             risk = max(0.01, stop - close)
             target = max(0.01, close - risk * target_rr)
 
-        return self._finalize_signal(c, side, close, stop, target, "trend", regime_score, frame, data, vol_scale=vol_scale)
+        return self._finalize_signal(c, side, close, stop, target, "trend", regime_score, frame, data, vol_scale=vol_scale,
+                                     trend_day_pass=trend_day_pass)

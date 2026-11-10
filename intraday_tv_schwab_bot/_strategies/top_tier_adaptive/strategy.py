@@ -33,7 +33,7 @@ import pandas as pd
 from ...bars import session_bucket_ends
 from ...indicators import get_session_indicator_window, htf_ema_spans, last_bar_atr, ltf_ema_spans
 from ...models import Candidate, Position, Side, Signal
-from ...sessions import EQUITY_RTH_OPEN, equity_session_state, is_regular_equity_session, parse_hhmm
+from ...sessions import EQUITY_RTH_OPEN, equity_session_state, is_hhmm, is_regular_equity_session, parse_hhmm
 from ...numeric import safe_float
 from ...reasons import detail_fields, insufficient_bars_reason, reason_gate
 from ...support_resistance import role_levels
@@ -251,6 +251,13 @@ NUMBER_KNOBS = (
     ("range_min_stop_atr_mult", False, 0.0, True, None, True),
     ("vol_squeeze_stop_box_mult", False, 0.0, True, None, True),
     ("vwap_reclaim_max_dip_age_bars", True, 1, True, None, True),
+    # The high-conviction override's bridge (2026-11-10): the fraction of
+    # the peak kept between the default arming and the override's; 0 = no
+    # bridge (TradeManager._peak_giveback_triggered).
+    ("peak_giveback_high_conviction_bridge_retain", False, 0.0, True, 1.0, False),
+    # The trend-day pass (2026-11-10, ``_trend_day_pass``): the sector's day
+    # strength toward the trade, in percent, from which it applies; 0 = off.
+    ("trend_day_pass_sector_pct", False, 0.0, True, None, True),
 )
 # As NUMBER_KNOBS, and null is allowed too: the breakeven tier's arm, which
 # null turns off (2026-11-07; BaseStrategy._adaptive_management_components
@@ -260,13 +267,25 @@ NUMBER_KNOBS = (
 NULLABLE_NUMBER_KNOBS = (
     ("adaptive_breakeven_rr", False, 0.0, False, None, True),
 )
+# HH:MM times (24-hour ET) checked at load like the knobs above: the clock
+# the trend-day pass applies before.
+TIME_KNOBS = ("trend_day_pass_until",)
+# The armed retest's resolved states, the only builds the trend-day pass
+# applies to: the retest the arm waited for, confirmed, and the market entry
+# of an arm whose wait expired with the breakout held.
+TREND_DAY_PASS_ARM_STATUSES = frozenset({"retest_confirmed", "expired_market_entry"})
+# The exhaustion check the trend-day pass waives (its reason head,
+# ``BaseStrategy._entry_exhaustion_reasons``); the other exhaustion checks
+# refuse under the pass as ever.
+TREND_DAY_PASS_EXHAUSTION_HEAD = "too_extended_from_vwap_atr"
 
 
 def checked_knobs(params: Mapping[str, Any], strategy_name: str) -> None:
     """Refuse, with a ValueError naming the key, a knob of
     ``STRICT_BOOL_KNOBS`` that is not true or false, one of ``NUMBER_KNOBS``
     that is not a finite number in its bounds (a whole number where it
-    counts bars; one of ``NULLABLE_NUMBER_KNOBS`` may be null too), a
+    counts bars; one of ``NULLABLE_NUMBER_KNOBS`` may be null too), one of
+    ``TIME_KNOBS`` that is not an HH:MM time, a
     missing one of any, and a bad ``require_htf_ema_alignment`` mode or
     LTF / HTF EMA span pair. The load runs it on the params of every
     strategy a config sets (``normalize_params``), and the strategy again
@@ -299,6 +318,11 @@ def checked_knobs(params: Mapping[str, Any], strategy_name: str) -> None:
                 bounds.append(f"{'<=' if high_ok else '<'} {high}")
             raise ValueError(f"strategies.{strategy_name}.params.{key} must be {kind}"
                              f"{' ' + ' and '.join(bounds) if bounds else ''}, got {value!r}")
+    for key in TIME_KNOBS:
+        if key not in params:
+            raise ValueError(f"strategies.{strategy_name}.params.{key} is missing: the strategy's manifest declares it")
+        if not is_hhmm(params[key]):
+            raise ValueError(f"strategies.{strategy_name}.params.{key} must be an HH:MM time, got {params[key]!r}")
     if "require_htf_ema_alignment" not in params:
         raise ValueError(f"strategies.{strategy_name}.params.require_htf_ema_alignment is missing: the strategy's "
                          "manifest declares it")
@@ -372,6 +396,10 @@ class _CandidateRead:
     thresholds: dict[str, float]
     tech_ctx_for_candidate: Any
     vol_widening: float
+    # The sector's day strength the trend-day pass reads
+    # (``_trend_day_pass``), or None while the pass cannot apply: the knob
+    # off, the clock past its limit, or no sector ETF that reads.
+    trend_day_sector_strength: float | None
 
 
 class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin,
@@ -379,8 +407,10 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                               VolSqueezeRegimeMixin, MomentumRegimeMixin, VwapReclaimRegimeMixin,
                               SrScalpRegimeMixin, BaseStrategy):
     strategy_name = "top_tier_adaptive"
+    # ``TIME_KNOBS`` are checked at load too, and must be present
+    # (``checked_knobs``); the others are parsed here, where present.
     time_params = ("orb_end_time", "midday_start_time", "midday_end_time", "afternoon_start_time",
-                   "no_new_entries_after", "early_session_stop_widening_until")
+                   "no_new_entries_after", "early_session_stop_widening_until", *TIME_KNOBS)
     # Whether this strategy may judge its protective exits on the executable
     # side (``protective_exits_knob``); small_cap_squeeze may not yet.
     protective_exits_on_book_allowed = True
@@ -688,10 +718,19 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
     def _finalize_signal(self, c: Candidate, side: Side, close: float, stop: float,
                          target: float, regime: str, regime_score: float,
                          frame: pd.DataFrame, data=None, vol_scale: float = 1.0,
-                         raw_rr_gate: str | None = None) -> Signal | None:
+                         raw_rr_gate: str | None = None,
+                         trend_day_pass: str | None = None) -> Signal | None:
         """Run top_tier's own gates, hand the entry to the shared entry stage,
         then build the ladder / runner / management on the levels it admitted
         and emit the Signal.
+
+        ``trend_day_pass`` is the build's trend-day pass (``_trend_day_pass``,
+        its detail; None = none): with one, the stretched check and its
+        cooldown, the S/R veto's HTF clearance and the exhaustion check's
+        VWAP extension do not refuse. Each one that would have is kept, as
+        the refusal it would have been, in the signal's
+        ``gate_trend_day_pass_waived`` beside ``gate_trend_day_pass`` (the
+        detail), so the entries only the pass admitted can be told apart.
 
         Order: the top_tier-only gates (Fix D, stretched / tech bias, the ORB
         5m follow-through, HTF bias / pivot, HTF EMA, the ORB opposing-level
@@ -746,6 +785,8 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # the gate silently, so switching the context off switched the
         # anti-chase gates off with it.
         side_prefix = "long" if side == Side.LONG else "short"
+        # The refusals the trend-day pass waived on this build.
+        waived: list[str] = []
         if regime in {"trend", "pullback", "sr_scalp"}:
             if bool(self.params.get("reject_oversized_entry_bar", True)):
                 atr14 = safe_float(getattr(tech_ctx, "atr14", None))
@@ -812,12 +853,12 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                     if last_fail is not None:
                         elapsed_min = (sessions.now_et() - last_fail).total_seconds() / 60.0
                         if elapsed_min < cooldown_min:
-                            self._set_build_failure(
-                                c.symbol, regime,
-                                f"{side_prefix}_stretched_cooldown("
-                                f"elapsed={elapsed_min:.1f}m<{cooldown_min:.1f}m)",
-                            )
-                            return None
+                            cooldown_refusal = (f"{side_prefix}_stretched_cooldown("
+                                                f"elapsed={elapsed_min:.1f}m<{cooldown_min:.1f}m)")
+                            if trend_day_pass is None:
+                                self._set_build_failure(c.symbol, regime, cooldown_refusal)
+                                return None
+                            waived.append(cooldown_refusal)
                 pct_b = safe_float(getattr(tech_ctx, "bollinger_percent_b", None))
                 atr_stretch = safe_float(getattr(tech_ctx, "atr_stretch_ema20_mult", None))
                 pct_b_max = float(self.params.get("stretched_percent_b_max", 0.80))
@@ -828,16 +869,22 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                         f"{side_prefix}_stretched_unreadable(pct_b={pct_b},stretch={atr_stretch})",
                     )
                     return None
+                # Under the trend-day pass a stretched read is waived: it
+                # does not refuse this build. It still starts the symbol's
+                # cooldown, which the pass waives for its own builds and
+                # which holds for every build without one, as before the
+                # pass.
                 if (
                     side == Side.LONG
                     and pct_b >= pct_b_max and atr_stretch >= stretch_max
                 ):
+                    stretched_refusal = (f"long_stretched_at_top(pct_b={pct_b:.3f}>={pct_b_max:.2f},"
+                                         f"stretch={atr_stretch:.2f}>={stretch_max:.2f})")
                     self._stretched_failure_time[c.symbol] = sessions.now_et()
-                    self._set_build_failure(
-                        c.symbol, regime,
-                        f"long_stretched_at_top(pct_b={pct_b:.3f}>={pct_b_max:.2f},stretch={atr_stretch:.2f}>={stretch_max:.2f})",
-                    )
-                    return None
+                    if trend_day_pass is None:
+                        self._set_build_failure(c.symbol, regime, stretched_refusal)
+                        return None
+                    waived.append(stretched_refusal)
                 if (
                     side == Side.SHORT
                     and pct_b <= (1.0 - pct_b_max) and atr_stretch >= stretch_max
@@ -849,12 +896,13 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                     # pct_b <= 0.15 = near lower band = stretched below. So the
                     # magnitude threshold stretch_max applies symmetrically to
                     # both sides; pct_b alone disambiguates direction.
+                    stretched_refusal = (f"short_stretched_at_bottom(pct_b={pct_b:.3f}<={1.0 - pct_b_max:.2f},"
+                                         f"stretch={atr_stretch:.2f}>={stretch_max:.2f})")
                     self._stretched_failure_time[c.symbol] = sessions.now_et()
-                    self._set_build_failure(
-                        c.symbol, regime,
-                        f"short_stretched_at_bottom(pct_b={pct_b:.3f}<={1.0 - pct_b_max:.2f},stretch={atr_stretch:.2f}>={stretch_max:.2f})",
-                    )
-                    return None
+                    if trend_day_pass is None:
+                        self._set_build_failure(c.symbol, regime, stretched_refusal)
+                        return None
+                    waived.append(stretched_refusal)
             if bool(self.params.get("reject_tech_bias_contradiction", True)):
                 dmi_bias = str(getattr(tech_ctx, "dmi_bias", "neutral") or "neutral").lower()
                 obv_bias = str(getattr(tech_ctx, "obv_bias", "neutral") or "neutral").lower()
@@ -1117,9 +1165,11 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             raw_rr_gate=raw_rr_gate, htf_ctx=htf_ctx,
             contexts=EntryContexts(sr=sr_ctx, ms=ms_ctx, tech=tech_ctx, chart=ctx),
             vol_scale=vol_scale,
+            waive_sr_clearance=trend_day_pass is not None,
         ))
         if admitted is None:
             return None
+        waived.extend(admitted.gates_waived)
         stop, target = admitted.stop, admitted.target
 
         # Entry exhaustion check — after the refinement, as it always ran;
@@ -1135,6 +1185,12 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             vwap = safe_float(frame.iloc[-1].get("vwap"), close)
             ema9 = safe_float(frame.iloc[-1].get("ema9"), close)
             exhaustion = self._entry_exhaustion_reasons(side, frame, close=close, vwap=vwap, ema9=ema9)
+            if trend_day_pass is not None:
+                # The pass waives the VWAP extension alone; the EMA9
+                # extension, the wick and the expansion bar refuse as ever.
+                vwap_extension = [r for r in exhaustion if r.startswith(TREND_DAY_PASS_EXHAUSTION_HEAD)]
+                waived.extend(vwap_extension)
+                exhaustion = [r for r in exhaustion if r not in vwap_extension]
             if exhaustion:
                 self._set_build_failure(c.symbol, regime, exhaustion[0])
                 return None
@@ -1284,6 +1340,27 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # post-ORB 10:05-11:00 window 2W/5T (+$126) thanks to TSLA). It was
         # the ORB-window flag until 2026-09-24; the orb regime is the only
         # one the window allows, so the two agree.
+        metadata: dict[str, Any] = {
+            "regime": regime,
+            "regime_score": round(regime_score, 4),
+            "structure_bonus": round(structure_bonus, 4),
+            "pattern_bonus": round(pattern_bonus, 4),
+            "candle_bonus": round(candle_bonus, 4),
+            "candle_confirmed": candle_confirmed,
+            "candle_tier": candle_signal.get("confirm_tier"),
+            "candle_anchor": candle_signal.get("anchor_pattern"),
+            "candle_matches": candle_signal.get("matches", []),
+            "orb_end_time": orb_end.strftime("%H:%M"),
+            "htf_ema_trend": htf_ema_bias,
+            "htf_ema_votes": f"{htf_ema_bull}v{htf_ema_bear}",
+            "htf_ema_bonus": round(htf_ema_bonus, 4),
+        }
+        if trend_day_pass is not None:
+            # Under ``gate_`` keys, a prefix the entry records keep
+            # (``audit_logger.structured_metadata_snapshot``). An empty
+            # list: the pass applied and no gate needed it.
+            metadata["gate_trend_day_pass"] = trend_day_pass
+            metadata["gate_trend_day_pass_waived"] = list(waived)
         return self.entry_policy.emit(
             admitted,
             reason=reason,
@@ -1291,21 +1368,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             management=management,
             target=target,
             ladder_meta=ladder_meta or None,
-            metadata={
-                "regime": regime,
-                "regime_score": round(regime_score, 4),
-                "structure_bonus": round(structure_bonus, 4),
-                "pattern_bonus": round(pattern_bonus, 4),
-                "candle_bonus": round(candle_bonus, 4),
-                "candle_confirmed": candle_confirmed,
-                "candle_tier": candle_signal.get("confirm_tier"),
-                "candle_anchor": candle_signal.get("anchor_pattern"),
-                "candle_matches": candle_signal.get("matches", []),
-                "orb_end_time": orb_end.strftime("%H:%M"),
-                "htf_ema_trend": htf_ema_bias,
-                "htf_ema_votes": f"{htf_ema_bull}v{htf_ema_bear}",
-                "htf_ema_bonus": round(htf_ema_bonus, 4),
-            },
+            metadata=metadata,
         )
 
     # ------------------------------------------------------------------
@@ -1808,6 +1871,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
         # trace in the decision row.
         relative_strength_drop: str | None = None
         relative_strength_skipped: str | None = None
+        sector_ds: float | None = None
         rs_threshold = self._pct_param("relative_strength_block_threshold_pct", 0.5, vol_scale)
         rs_orb_bypass = bool(self.params.get("orb_bypass_relative_strength", True)) and in_orb_window
         if rs_threshold > 0.0 and not rs_orb_bypass:
@@ -1840,6 +1904,17 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                     return None
                 if blocked_long or blocked_short:
                     relative_strength_drop = f"{'long' if blocked_long else 'short'}_{rs_detail}"
+
+        # The trend-day pass's read (2026-11-10, ``_trend_day_pass``): the
+        # sector's day strength while the pass is on and the clock is before
+        # its limit. The relative-strength gate's read where it took one
+        # this cycle, else the same read taken here (the gate off, in its
+        # ORB bypass, or skipped for a symbol with no beta). No sector ETF
+        # that reads means no pass: the gates it would waive stay.
+        trend_day_sector_strength: float | None = None
+        if self._trend_day_pass_open(now_t):
+            trend_day_sector_strength = (
+                sector_ds if sector_ds is not None else self._sector_day_strength(c.symbol, bars)[0])
 
         # Score thresholds — read once, used for both sides' qualifier
         # filtering.
@@ -1884,6 +1959,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             explicit_side_decided=explicit_side_decided, decided_side=decided_side,
             side_vote_note=side_vote_note, thresholds=thresholds,
             tech_ctx_for_candidate=tech_ctx_for_candidate, vol_widening=vol_widening,
+            trend_day_sector_strength=trend_day_sector_strength,
         )
 
     def _score_sides(self, cycle: _EntryCycle, read: _CandidateRead, data) -> list[tuple[Side, dict[str, Any]]]:
@@ -2187,6 +2263,48 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
 
         return queue
 
+    def _trend_day_pass_open(self, now_t: time) -> bool:
+        """Whether the trend-day pass can apply at ``now_t``: the knob on
+        (``trend_day_pass_sector_pct`` above 0) and the clock before
+        ``trend_day_pass_until``. Both are checked at load
+        (``checked_knobs``)."""
+        return (float(self.params["trend_day_pass_sector_pct"]) > 0.0
+                and now_t < parse_hhmm(self.params["trend_day_pass_until"]))
+
+    def _trend_day_pass(self, side: Side, sector_day_strength: float | None,
+                        armed_retest_status: str | None) -> str | None:
+        """The trend-day pass for one build (2026-11-10): its detail, or
+        None when the build gets none.
+
+        On a day the symbol's sector ETF already runs the trade's way by
+        ``trend_day_pass_sector_pct`` percent from its session open, before
+        ``trend_day_pass_until``, an entry whose armed retest has resolved
+        (``TREND_DAY_PASS_ARM_STATUSES``: the confirmed retest, or the held
+        expiry's market entry) is not refused by three anti-chase gates:
+        the stretched check and its cooldown, the S/R veto's HTF clearance,
+        and the exhaustion check's VWAP extension. On such a morning a
+        leader sits at its band's top, far over VWAP and under the next HTF
+        level by construction, and the retest is the entry's proof. Every
+        other gate judges the entry as ever, a missing stretched read
+        refuses, a breakout / breakdown flag's S/R block stays, and a
+        waived stretched read still starts the symbol's cooldown for the
+        builds that carry no pass.
+
+        ``sector_day_strength`` is the read ``_read_candidate`` took (None
+        while the pass cannot apply). The replay it rests on (23 archived
+        days 10-01..11-09 and 8 held-out September days): 33 entries before
+        11:00 that only the pass admitted, 18 winners, +11.69R; from 11:00
+        the same pass added 83 entries at -6.75R, one 9.13R winner among
+        them, hence the clock."""
+        if sector_day_strength is None or armed_retest_status not in TREND_DAY_PASS_ARM_STATUSES:
+            return None
+        threshold = float(self.params["trend_day_pass_sector_pct"])
+        toward = float(sector_day_strength) if side == Side.LONG else -float(sector_day_strength)
+        if toward < threshold:
+            return None
+        return (f"sector_day_strength={float(sector_day_strength):+.2f}%,threshold={threshold:.2f}%,"
+                f"until={parse_hhmm(self.params['trend_day_pass_until']).strftime('%H:%M')}")
+
     def _run_build_queue(self, read: _CandidateRead,
                          queue: list[tuple[bool, Side, str, float, float, dict[str, Any]]],
                          fail_reasons: list[str],
@@ -2361,9 +2479,15 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                 # gate in advance; a wait never reaches the builder.
                 breakout_confirmed = verdict["status"] == "enter"
 
+            # The trend-day pass (``_trend_day_pass``): only a resolved arm
+            # carries one, so only the two armed-retest regimes' builders
+            # take it.
+            trend_day_pass = self._trend_day_pass(
+                side, read.trend_day_sector_strength, retest_meta.get("armed_retest_status"))
+
             sig = None
             if regime_name == "trend":
-                sig = self._build_trend_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale, breakout_confirmed=breakout_confirmed)
+                sig = self._build_trend_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale, breakout_confirmed=breakout_confirmed, trend_day_pass=trend_day_pass)
             elif regime_name == "pullback":
                 sig = self._build_pullback_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale, ltf_forming=read.ltf_forming)
             elif regime_name == "range":
@@ -2371,7 +2495,7 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
             elif regime_name == "vol_squeeze":
                 sig = self._build_vol_squeeze_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
             elif regime_name == "momentum":
-                sig = self._build_momentum_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale, breakout_confirmed=breakout_confirmed)
+                sig = self._build_momentum_signal(c, side, close, atr, ltf, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale, breakout_confirmed=breakout_confirmed, trend_day_pass=trend_day_pass)
             elif regime_name == "sr_scalp":
                 sig = self._build_sr_scalp_signal(c, side, close, atr, frame, regime_score, data, vol_widening=vol_widening, vol_scale=vol_scale)
             elif regime_name == "orb":
@@ -2434,6 +2558,13 @@ class TopTierAdaptiveStrategy(ScheduleMixin, ConfirmationMixin, ArmedRetestMixin
                         if isinstance(sig.metadata, dict):
                             sig.metadata["peak_giveback_min_r_override"] = override_r
                             sig.metadata["peak_giveback_high_conviction_day_strength"] = round(float(day_strength), 4)
+                            # The override's bridge (2026-11-10): between the
+                            # default arming and the override's, the trade
+                            # manager exits at this fraction of the peak
+                            # (``_peak_giveback_triggered``). 0 stamps none.
+                            bridge_retain = float(self.params["peak_giveback_high_conviction_bridge_retain"])
+                            if bridge_retain > 0.0:
+                                sig.metadata["peak_giveback_bridge_retain"] = bridge_retain
                 # Stamp the volatility widening factor for post-mortem.
                 # Always stamped when Tier 2a is enabled (even when the
                 # factor is 1.0 — disambiguates "feature disabled" from

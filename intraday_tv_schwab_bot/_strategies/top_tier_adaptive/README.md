@@ -41,7 +41,7 @@ Not all regimes fire at all times. All boundaries are param-driven (no hard-code
 - **After `no_new_entries_after`**: no new entries
 - **With `disable_orb_regime: true`** (the shipped preset): no range-formation zone and no ORB window — the primary mix runs from 09:30 (entries from 09:35, the preset's `entry_windows` open; a 5m setup qualifies from 09:45, once three of the session's buckets have closed), **except sr_scalp, which still waits for `orb_end_time`**. Range is in the windows below but off in the shipped preset (`disable_range_regime: true`, 2026-10-12).
 
-Default boundary values: opening range `09:30`-`09:45` (`orb_range_minutes: 15`), ORB end `10:05`, midday `11:30`-`13:00`, afternoon `13:00`-`no_new_entries_after` (`15:00` in the shipped RTH-only preset; `19:30` if extended-hours trading is enabled).
+Default boundary values: opening range `09:30`-`09:45` (`orb_range_minutes: 15`), ORB end `10:05`, midday `11:30`-`13:00`, afternoon `13:00`-`no_new_entries_after` (`15:00` in the manifest; the shipped preset stops entries at `13:00` since 2026-11-10, section 25, so its afternoon window is empty; `19:30` if extended-hours trading is enabled).
 
 Midday still favors pullbacks because top-tier stocks tend to chop during the lunch hour, but the momentum, sr_scalp and (since 2026-09-21) vol_squeeze regimes are allowed alongside — that chop is itself the compression vol_squeeze trades — the `momentum_min_day_strength` hard gate (default 1.5%) and the sr_scalp HTF zone-gap floor filter out non-qualifying names automatically. As of 2026-05-12 the momentum regime is post-ORB-through-close (renamed from `momentum_close` and widened from afternoon-only) and sr_scalp is post-ORB-through-close.
 
@@ -245,6 +245,7 @@ Once a position is open, it goes through the adaptive management pipeline:
 - **Profit lock** (`adaptive_profit_lock_rr`): at the configured peak, stop moves to `adaptive_profit_lock_stop_rr` above entry. The shipped preset: 1.20R, locking +0.50R (0.85R / +0.45R from 2026-07-27 to 2026-11-07).
 - **Runner extension** (`adaptive_runner_trigger_rr`): at 1.15R with strong FVG continuation bias + aligned structure, target extends and trailing stop activates.
 - **Peak giveback floors** (`risk.peak_giveback_*`, section 14): the main floor arms at `peak_giveback_min_r` (the shipped preset 1.25R since 2026-11-07, 1.0R before) and exits on a retrace below the retained fraction of the peak; the low tier is off in the shipped preset since 2026-11-07.
+- **The override's bridge** (`peak_giveback_high_conviction_bridge_retain`, section 25; 2026-11-10): on a high-conviction day the override moves the main floor's arming to 2.5R, which left a trade that peaked between 1.25R and 2.5R with no giveback floor at all. With the bridge (0.5 in the shipped preset) such a peak exits once the trade is back to half of it, as `peak_giveback_bridge:peak1.70R_floor0.85R_minR1.25`.
 
 The 2026-11-07 retune replayed H:'s 124 dry-run trades of 2026-10-14..11-06 on their 1m bars with the same entries: the 07-27 triggers cashed 0.4-0.9R winners against full 1R losers (+$360 replayed); no breakeven move, the lock at 1.20R to +0.50R and the floor from 1.25R made +$990; the raw bracket, no management at all, +$1,675. About 45% of any variant's gain sat in its five best trades.
 
@@ -338,7 +339,7 @@ Purpose: multi-regime adaptive strategy for a fixed list of 25 mega-cap Tech / A
 
 Default windows:
 
-- `entry_windows`: `[["09:35", "15:00"]]` in the shipped preset (2026-09-23; was 09:45). The manifest keeps `[["09:45", "15:00"]]` because its defaults leave the ORB regime on, and with ORB on 09:30-09:45 is a no-entry zone anyway
+- `entry_windows`: `[["09:35", "13:00"]]` in the shipped preset (the open 2026-09-23, was 09:45; the close 2026-11-10, was 15:00, with `no_new_entries_after`: section 25). The manifest keeps `[["09:45", "15:00"]]` because its defaults leave the ORB regime on, and with ORB on 09:30-09:45 is a no-entry zone anyway
 - `management_windows`: `[["09:30", "15:55"]]`
 - `screener_windows`: `[["09:30", "15:00"]]`
 
@@ -388,6 +389,8 @@ Strategy-specific knobs:
 - `orb_bypass_side_decision`: skip the explicit side decision during the ORB window (through `orb_end_time`) (default `true`).
 - `require_entry_confirmation_bar`: require the last fully closed 1m bar (the step frame's, whatever the LTF) to confirm direction (green AND > prior close for LONG; mirror for SHORT) before entry on trend/pullback/momentum/vol_squeeze regimes, and vwap_reclaim since 2026-11-08 (default `true`). See section 6f Fix B.
 - `armed_retest_enabled` / `armed_retest_max_minutes` / `armed_retest_zone_atr` / `armed_retest_min_close_position` / `armed_retest_invalidation_atr`: the armed-retest trigger for `trend` and `momentum` - qualifying records the level that was cleared and waits for price to retest it, entering at market only if the wait expires (the retest is a retrace into the zone under the breakout bar's close, 2026-11-08; defaults `true` / `12.0` / `0.15` / `0.60` / `0.33`; the zone and the invalidation band are multiples of the 5m ATR since 2026-10-13, `0.35` / `0.75` of the 1m LTF's ATR before, the same price distances). See section 24.
+- `trend_day_pass_sector_pct` / `trend_day_pass_until`: the trend-day pass (section 25). With the sector ETF's day strength at least this many percent toward the trade and the clock before the limit, a `trend` / `momentum` entry whose armed retest has resolved is not refused by the stretched check and its cooldown, the S/R veto's HTF clearance, or the exhaustion check's VWAP extension. `0` turns it off (the manifest's default; the shipped preset sets `1.5` and `"11:00"`). Both are checked at load.
+- `peak_giveback_high_conviction_bridge_retain`: the high-conviction override's bridge (section 25). Stamped beside the override; between `risk.peak_giveback_min_r` and the override's arming the trade manager exits once the trade is back to this fraction of its peak (`peak_giveback_bridge`). At least `0` and under `1`; `0` stamps none (the manifest's default; the shipped preset sets `0.5`).
 - `sector_groups`: co-movement groupings - ETF routing (`sector_index_map`) and the peer list for breadth confirmation.
 - `correlation_groups`: coarser risk groupings for the concentration guard.
 - `max_same_correlation_group_same_direction`: max same-direction positions per correlation group.
@@ -486,6 +489,9 @@ Current code defaults:
 | `armed_retest_zone_atr`              | `0.15`                                                                                                                        |
 | `armed_retest_min_close_position`    | `0.60`                                                                                                                        |
 | `armed_retest_invalidation_atr`      | `0.33`                                                                                                                        |
+| `trend_day_pass_sector_pct`          | `0.0`                                                                                                                         |
+| `trend_day_pass_until`               | `11:00`                                                                                                                       |
+| `peak_giveback_high_conviction_bridge_retain`| `0.0`                                                                                                                 |
 | `side_decision_recent_lookback_bars` | `6`                                                                                                                           |
 | `trailing_bias_lookback`             | `2`                                                                                                                           |
 | `range_min_stop_atr_mult`            | `0.5`                                                                                                                         |
@@ -790,6 +796,17 @@ so R:R asymptotes to 1.5 without reaching it (1.07 at a 1-ATR range, 1.37 at
 raised to 1.5, ORB would become mathematically incapable of producing a signal,
 silently.
 
+**2026-11-10, the cap off.** A replay of 23 archived days (10-01..11-09) with
+`disable_orb_regime: false` confirmed the above (a break scored on 334 of 575
+symbol-days and every one was refused as `orb_range_too_wide`; the regime
+only held the other regimes back to `orb_end_time`, -3.25R) and then ran the
+regime with `orb_max_range_atr_mult: 0`: 118 ORB trades, 38% winners,
+-12.51R (LONG 56 trades +2.67R, SHORT 62 trades -15.19R), 60 of them straight
+to the initial stop. No range width, sector direction or gap size separated
+winners from losers in both halves of the sample. On 11-09 itself it won 3 of
+3 (AMD +1.73R). Widening the cap alone is therefore not a fix; the regime
+stays off and the cap stays as it is.
+
 ## 24. Armed retest: qualifying arms the trigger, the retest fires it (2026-09-20)
 
 `trend` and `momentum` both enter on `close > max(high of the previous N bars)`
@@ -1037,3 +1054,75 @@ records named 605 refused confirmations (the stretched gate 52%, its cooldown
 fresh-breakout check and the armed level. Two copies would drift the moment
 either lookback was retuned, and the bot would arm on one level and enter
 against another.
+
+## 25. The 13:00 entry cutoff, the trend-day pass and the override's bridge (2026-11-10)
+
+Three changes from one offline study: 18 candidate changes replayed on 23
+archived days (10-01..11-09) through the real bot on fakes, then the
+survivors on 8 held-out September days (09-18, 09-21..25, 09-29, 09-30). All
+three are preset choices over knobs that default to off or to the old
+value.
+
+**Entries stop at 13:00** (`entry_windows` and `no_new_entries_after`; 15:00
+until then). On the 23 days the baseline's 10 entries from 13:00 on had 2
+winners and lost 6.64R, 7 of them straight to the initial stop; the older and
+the recent half agree (-3.24R and -3.40R). The held-out days: 3 entries, no
+winner, -1.25R. It is a filter, not a fix: why afternoon entries fail is not
+known. Open positions are managed to the close as before, and the screener
+keeps running so the afternoon's watchlist bars are archived for a re-test.
+To trade the afternoon again, raise both values.
+
+**The trend-day pass** (`trend_day_pass_sector_pct: 1.5`,
+`trend_day_pass_until: "11:00"`; `_trend_day_pass`). On a morning the
+symbol's sector ETF already runs the trade's way by 1.5% from its open, a
+leader sits at its band's top, far over VWAP and just under the next HTF
+level by construction, and three anti-chase gates refuse it all morning. With
+the pass, a `trend` or `momentum` entry whose armed retest has resolved
+(`retest_confirmed`, or the held expiry's `expired_market_entry`) is not
+refused by:
+
+- the stretched check (`long_stretched_at_top` / `short_stretched_at_bottom`)
+  and its cooldown. A waived stretched read still starts the symbol's
+  cooldown, which holds for every build without a pass as before;
+- the S/R veto's HTF clearance (`too_close_to_htf_resistance` / `_support`;
+  a breakout / breakdown flag's block stays);
+- the exhaustion check's VWAP extension (`too_extended_from_vwap_atr`; the
+  EMA9 extension, the wick and the expansion bar stay, and the expansion
+  bar reads the VWAP extension too, so a pass entry on an oversized bar can
+  still be refused).
+
+Every other gate judges the entry as ever, a missing stretched read refuses,
+and an ETF that does not read gives no pass. A build the pass applied to and
+a later gate refused shows that gate's refusal only: the record of what the
+pass waived is on admitted entries. The entry carries
+`gate_trend_day_pass` (the sector read, the threshold and the limit) and
+`gate_trend_day_pass_waived` (each refusal the pass waived, as the text it
+would have refused with; an empty list when no gate needed it), and the
+shared stage stamps the waived clearance as `shared_entry_gates_waived`.
+
+The clock is the point. Before 11:00 the pass admitted 25 entries on the 23
+days, 13 winners, +9.45R, and 8 on the held-out days, 5 winners, +2.24R.
+From 11:00 on it admitted 65 at +0.05R (one 9.13R winner among them) and 18
+at -6.80R. The held-out support is thin: the 8 entries fall on three days,
+the gain on one of them, and those days' archives hold a shorter HTF
+history.
+
+**The override's bridge** (`peak_giveback_high_conviction_bridge_retain:
+0.5`). Section 12 has the mechanism. On the 23 days it moved 4 exits, from
+0.33R-0.50R to 0.78R-1.08R, and worsened none; on the held-out days no trade
+peaked in its span.
+
+The three together, replayed as one run on the 31 days:
+
+| | Trades | Winners | Total R |
+|---|---|---|---|
+| 23 study days, before | 75 | 50.7% | +6.54 |
+| 23 study days, with the three | 90 | 54.4% | +24.53 |
+| 8 held-out days, before | 25 | 40.0% | +1.18 |
+| 8 held-out days, with the three | 30 | 50.0% | +4.67 |
+
+The run takes exactly the trades the separate runs predicted, and the bridge
+moved one more exit, on an entry the pass admitted. The figures are mostly
+in-sample: the 13:00 and 11:00 clocks were chosen on the 23 days. With the
+three knobs at their old values the same code replays 11-09 step for step as
+the code before it. The dry run is the test.

@@ -91,6 +91,11 @@ entry-context + FVG score ranks competing signals at each regime's own scale.
   entries, -2.45R. Both manifests hold it to the veto now; the dip knobs
   (`vwap_reclaim_max_dip_age_bars`, `vwap_reclaim_require_held_bucket`) are
   declared here at the old reading (6 / false).
+- top_tier's trend-day pass and its override's bridge (2026-11-10) are off
+  here: the manifest declares `trend_day_pass_sector_pct` and
+  `peak_giveback_high_conviction_bridge_retain` at 0, and the preset sets
+  neither. The pass could not apply in any case: it reads a sector ETF and
+  this strategy has none.
 
 The retired
 `orb_bypass_structure_entry` / `orb_bypass_sr_entry` /

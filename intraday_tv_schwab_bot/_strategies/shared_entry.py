@@ -321,6 +321,12 @@ class EntryProposal:
       near-miss data).
     - ``symbol``: the traded symbol when it is not the candidate's
       (pairs_residual's leg); defaults to ``candidate.symbol``.
+    - ``waive_sr_clearance``: the strategy waives the S/R veto's clearance
+      refusal for this entry (``too_close_to_htf_resistance`` /
+      ``too_close_to_htf_support``): the veto still runs, and a clearance
+      block is recorded on the admitted entry (``gates_waived``) in place
+      of refusing. A breakout / breakdown flag's block refuses as ever.
+      top_tier's trend-day pass sets it (2026-11-10).
     """
 
     candidate: Candidate
@@ -343,6 +349,7 @@ class EntryProposal:
     contexts: EntryContexts | None = None
     vol_scale: float = 1.0
     failure_details: Mapping[str, Any] | None = None
+    waive_sr_clearance: bool = False
     symbol: str = ""
     zone_frame: pd.DataFrame | None = None
     failure_key: str | None = None
@@ -392,6 +399,9 @@ class AdmittedEntry:
       on this proposal when ``use_divergence_entry_signal`` is on.
     - ``gates_abstained``: applied vetoes that could not judge the tape and
       let the proposal through (the candle veto on single-print bars).
+    - ``gates_waived``: the refusals the proposal waived
+      (``waive_sr_clearance``), each as the reason it would have refused
+      with; ``emit`` stamps them as ``shared_entry_gates_waived``.
     """
 
     proposal: EntryProposal
@@ -412,6 +422,7 @@ class AdmittedEntry:
     gates_applied: tuple[str, ...]
     gates_exempted: tuple[str, ...]
     gates_abstained: tuple[str, ...] = ()
+    gates_waived: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # dataclasses.replace() rebuilds through __init__ too, so an admitted
@@ -618,7 +629,7 @@ class SharedEntryPolicy:
         # carry an entry past one (the chart filter used to run only while
         # nothing else was pending, so a retest-admitted entry never met it),
         # and all of them run, so the refusal lists every blocker.
-        vetoes, applied, exempted, abstained = self._vetoes(p, sr, ms, tech, chart, candle_signal)
+        vetoes, applied, exempted, abstained, waived = self._vetoes(p, sr, ms, tech, chart, candle_signal)
         blockers = pending + [reason for reason in vetoes if reason not in pending]
         if blockers:
             return self._refuse(p, blockers)
@@ -678,6 +689,7 @@ class SharedEntryPolicy:
                 gates_applied=applied,
                 gates_exempted=exempted,
                 gates_abstained=abstained,
+                gates_waived=waived,
             )
         finally:
             _MINTING.active = False
@@ -703,11 +715,13 @@ class SharedEntryPolicy:
             plans.append(self._continuation_ob_retest_plan(p.direction, p.symbol, zone_frame, p.data, **kwargs))
         return tuple(plans)
 
-    def _vetoes(self, p: EntryProposal, sr, ms, tech, chart, candle_signal) -> tuple[list[str], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    def _vetoes(self, p: EntryProposal, sr, ms, tech, chart, candle_signal) -> tuple[
+            list[str], tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
         """The P3 vetoes that are switched on, in ``VETO_GATES`` order, each
         judged on ``p.direction`` (the market direction, never an order
         side). Returns (blockers, gates applied, gates the manifest exempts
-        for ``p.style``, applied gates that abstained)."""
+        for ``p.style``, applied gates that abstained, the refusals the
+        proposal waived)."""
         cfg = self.config.shared_entry
         long = p.direction == Side.LONG
         switched_on = {
@@ -727,6 +741,7 @@ class SharedEntryPolicy:
         applied: list[str] = []
         exempted: list[str] = []
         abstained: list[str] = []
+        waived: list[str] = []
         for gate in VETO_GATES:
             if not switched_on[gate]:
                 continue
@@ -741,6 +756,12 @@ class SharedEntryPolicy:
             elif gate == "sr":
                 if self._blocks_bullish_sr_entry(sr) if long else self._blocks_bearish_sr_entry(sr):
                     reason = self._bullish_sr_block_reason(sr) if long else self._bearish_sr_block_reason(sr)
+                    # The block is the flag's when the flag blocks, else the
+                    # clearance's (the same order the reason is built in):
+                    # only the clearance's can be waived.
+                    if p.waive_sr_clearance and not _sr_flag_blocks(sr, p.direction):
+                        waived.append(reason)
+                        reason = None
             elif gate == "broken_level":
                 reason = self._broken_level_reason(p, sr)
             elif gate == "chart":
@@ -760,7 +781,7 @@ class SharedEntryPolicy:
                 reason = self._opposing_candle_reason(p, candle_signal)
             if reason:
                 blockers.append(reason)
-        return blockers, tuple(applied), tuple(exempted), tuple(abstained)
+        return blockers, tuple(applied), tuple(exempted), tuple(abstained), tuple(waived)
 
     def _broken_level_reason(self, p: EntryProposal, sr_ctx) -> str | None:
         """A confirmed BROKEN level just beyond the entry (broken_support
@@ -908,6 +929,8 @@ class SharedEntryPolicy:
         })
         if "candle" in admitted.gates_abstained:
             meta["shared_entry_candle_abstained"] = "zero_range"
+        if admitted.gates_waived:
+            meta["shared_entry_gates_waived"] = list(admitted.gates_waived)
         divergence = admitted.divergence_confirmation
         if divergence is not None:
             if divergence.get("confirmed"):

@@ -140,11 +140,15 @@ TARGET_HOLD_GUARD = "target_hold_guard"
 TARGET_HOLD_TIMEOUT = "target_hold_timeout"
 
 # The peak giveback's exit codes (TradeManager.update_position): the main
-# tier, the high-conviction override's and the low tier's.
+# tier, the high-conviction override's, the low tier's, and the bridge's
+# under the override (2026-11-10).
 PEAK_GIVEBACK = "peak_giveback"
 PEAK_GIVEBACK_HIGH_CONVICTION = "peak_giveback_high_conviction"
 PEAK_GIVEBACK_LOW_TIER = "peak_giveback_low_tier"
-PEAK_GIVEBACK_CODES = frozenset({PEAK_GIVEBACK, PEAK_GIVEBACK_HIGH_CONVICTION, PEAK_GIVEBACK_LOW_TIER})
+PEAK_GIVEBACK_BRIDGE = "peak_giveback_bridge"
+PEAK_GIVEBACK_CODES = frozenset({
+    PEAK_GIVEBACK, PEAK_GIVEBACK_HIGH_CONVICTION, PEAK_GIVEBACK_LOW_TIER, PEAK_GIVEBACK_BRIDGE,
+})
 # The exits the position manager books from a resting broker child that
 # filled (a bracket's stop or target, the static disaster stop), and the
 # bracket record's field holding the price the child rested at.

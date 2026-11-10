@@ -91,7 +91,8 @@ class MomentumRegimeMixin:
                                ltf: pd.DataFrame, frame: pd.DataFrame,
                                regime_score: float, data=None,
                                vol_widening: float = 1.0, vol_scale: float = 1.0,
-                               breakout_confirmed: bool = False) -> Signal | None:
+                               breakout_confirmed: bool = False,
+                               trend_day_pass: str | None = None) -> Signal | None:
         """Build a momentum-from-open continuation signal. Stops anchor below
         recent swing low (LONG) / above recent swing high (SHORT) with an
         ATR-cushioned buffer so single-bar wicks (during midday's lower volume
@@ -108,7 +109,8 @@ class MomentumRegimeMixin:
         ``breakout_confirmed`` is set by an armed retest -- a confirmed retest,
         or an expired arm whose breakout still holds -- where the breakout is
         already established and the fresh-breakout gate would reject the fill
-        by definition. See ``_build_trend_signal``.
+        by definition. See ``_build_trend_signal``. ``trend_day_pass`` is such
+        an entry's trend-day pass, handed on to ``_finalize_signal``.
         """
         recent, trigger_level = self._breakout_reference("momentum", side, ltf)
         if recent is None or recent.empty:
@@ -153,4 +155,5 @@ class MomentumRegimeMixin:
             risk = max(0.01, stop - close)
             target = max(0.01, close - risk * target_rr)
 
-        return self._finalize_signal(c, side, close, stop, target, "momentum", regime_score, frame, data, vol_scale=vol_scale)
+        return self._finalize_signal(c, side, close, stop, target, "momentum", regime_score, frame, data, vol_scale=vol_scale,
+                                     trend_day_pass=trend_day_pass)

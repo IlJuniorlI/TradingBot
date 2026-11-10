@@ -50,6 +50,7 @@ from .options_mode import time_decay_scale_of
 from .position_metrics import (
     LADDER_TOUCH_HOLD_KEY,
     PEAK_GIVEBACK,
+    PEAK_GIVEBACK_BRIDGE,
     PEAK_GIVEBACK_CODES,
     PEAK_GIVEBACK_HIGH_CONVICTION,
     PEAK_GIVEBACK_LOW_TIER,
@@ -583,7 +584,27 @@ class TradeManager:
                     meta["_peak_giveback_min_r_used"] = round(float(low_tier_min_r), 4)
                     meta["_peak_giveback_override_active"] = False
                     meta["_peak_giveback_low_tier_active"] = True
+                    meta["_peak_giveback_bridge_retain"] = None
                 return True
+
+        # The override's bridge (2026-11-10). The override raises the main
+        # tier's arming, so a trade that peaked between the default arming
+        # and the override's had no giveback floor at all and fell back to
+        # the profit lock: on the 23 replayed days (10-01..11-09) four such
+        # trades peaked at 1.60R-2.32R and left at 0.33R-0.50R. With a
+        # bridge stamped beside the override
+        # (``peak_giveback_bridge_retain``, top_tier's
+        # ``peak_giveback_high_conviction_bridge_retain``), such a peak
+        # exits once the current R falls to that fraction of it: a looser
+        # floor than the main tier's, kept until the peak reaches the
+        # override. No stamp, no bridge.
+        bridge_retain = self._peak_giveback_bridge_retain(position, meta) if override_active else None
+        if bridge_retain is not None and default_min_r <= peak_r < min_r and current_r <= peak_r * bridge_retain:
+            meta["_peak_giveback_min_r_used"] = round(float(default_min_r), 4)
+            meta["_peak_giveback_override_active"] = True
+            meta["_peak_giveback_low_tier_active"] = False
+            meta["_peak_giveback_bridge_retain"] = bridge_retain
+            return True
 
         if peak_r < min_r:
             return False
@@ -594,11 +615,32 @@ class TradeManager:
         if triggered and isinstance(meta, dict):
             # Stamp which threshold actually tripped so update_position can
             # emit a differentiated exit reason (default vs high-conviction
-            # vs low-tier).
+            # vs low-tier vs the bridge).
             meta["_peak_giveback_min_r_used"] = round(float(min_r), 4)
             meta["_peak_giveback_override_active"] = bool(override_active)
             meta["_peak_giveback_low_tier_active"] = False
+            meta["_peak_giveback_bridge_retain"] = None
         return triggered
+
+    @staticmethod
+    def _peak_giveback_bridge_retain(position: Position, meta: dict[str, Any]) -> float | None:
+        """The bridge's retain fraction stamped on the position
+        (``peak_giveback_bridge_retain``), or None with no stamp. The
+        strategy stamps a value its load checked (above 0, under 1); a stamp
+        that is anything else (a restored position's damaged record) is
+        logged with its type and dropped from the position, so it is
+        reported once, and the position has no bridge."""
+        stamp = meta.get("peak_giveback_bridge_retain")
+        if stamp is None:
+            return None
+        if not isinstance(stamp, (int, float)) or not 0.0 < float(stamp) < 1.0:
+            LOG.warning(
+                "peak_giveback_bridge_retain on %s (id=%s) is malformed (%r, %s); dropped, no bridge for this position",
+                position.symbol, getattr(position, "id", "?"), stamp, type(stamp).__name__,
+            )
+            del meta["peak_giveback_bridge_retain"]
+            return None
+        return float(stamp)
 
     def update_position(self, position: Position, last_price: float,
                         protective: ProtectiveRead | None) -> tuple[bool, str]:
@@ -647,11 +689,15 @@ class TradeManager:
             min_r_used = float(meta.get("_peak_giveback_min_r_used") or 0.0) if isinstance(meta, dict) else 0.0
             override_active = bool(meta.get("_peak_giveback_override_active")) if isinstance(meta, dict) else False
             low_tier_active = bool(meta.get("_peak_giveback_low_tier_active")) if isinstance(meta, dict) else False
+            bridge_retain = meta.get("_peak_giveback_bridge_retain") if isinstance(meta, dict) else None
             # Floor for the exit reason string: low-tier uses fixed
-            # giveback_frac × peak; main tier uses the peak-size ladder.
+            # giveback_frac × peak; the bridge its retain fraction × peak;
+            # main tier uses the peak-size ladder.
             if low_tier_active:
                 low_tier_frac = self.config.risk.peak_giveback_low_tier_giveback_frac
                 floor_r = peak_r * (1.0 - low_tier_frac)
+            elif bridge_retain is not None:
+                floor_r = peak_r * float(bridge_retain)
             else:
                 floor_r = self._peak_giveback_floor_r(peak_r)
             if isinstance(meta, dict):
@@ -671,12 +717,19 @@ class TradeManager:
                 meta["peak_giveback_min_r_used"] = round(min_r_used, 4)
                 meta["peak_giveback_override_active"] = override_active
                 meta["peak_giveback_low_tier_active"] = low_tier_active
+                # On a bridge exit only, so every other giveback exit's
+                # record is what it was before the bridge (2026-11-10).
+                if bridge_retain is not None:
+                    meta["peak_giveback_bridge_active"] = True
                 # Drop the internal sentinels (we promoted them above).
                 meta.pop("_peak_giveback_min_r_used", None)
                 meta.pop("_peak_giveback_override_active", None)
                 meta.pop("_peak_giveback_low_tier_active", None)
+                meta.pop("_peak_giveback_bridge_retain", None)
             if low_tier_active:
                 reason_tag = PEAK_GIVEBACK_LOW_TIER
+            elif bridge_retain is not None:
+                reason_tag = PEAK_GIVEBACK_BRIDGE
             elif override_active:
                 reason_tag = PEAK_GIVEBACK_HIGH_CONVICTION
             else:
