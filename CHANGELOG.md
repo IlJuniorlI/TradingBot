@@ -9,6 +9,27 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`swing_leader_pullback`, a daily-bar swing strategy (2026-11-10; dry run
+  only).** The first strategy that holds positions across sessions. Its
+  screener ranks the members of the configured TradingView indexes (the
+  S&P 500 and the Nasdaq-100) by 12-1 momentum and offers the top tenth; a
+  leader whose last completed session closed above its 200-session SMA with
+  RSI(2) under 10 is bought near the next open, with a stop 2 daily ATRs
+  under the entry and no target, and sold near a close once the price is
+  above its 5-close SMA or on the 10th session after the entry's. From the
+  2026-11-10 swing study: on 494 index members outside the top_tier names,
+  2006-2026, 9,032 trades made +0.25% a trade over the universe after costs
+  (monthly t 3.7; +0.18%, t 3.2, with the stop). A candidate, not a proven
+  edge: it missed one of the study's own rules (flat in 2015-19), and the
+  stock list is today's survivors. `test_rule_parity.py` drives the rule
+  over three names' bars and gets the study's 102 trades. The strategy
+  refuses to build with `schwab.dry_run: false`: the live path's resting
+  stop is a DAY order and a restart restores no multi-day position. A
+  dry-run restart drops the open paper positions. Earnings are not
+  avoided. New preset
+  `configs/config.swing_leader_pullback.yaml`; the strategy's README has the
+  rule, the measurement and what is not built.
+
 - **top_tier's trend-day pass (2026-11-10).** On a morning the symbol's
   sector ETF already runs the trade's way by `trend_day_pass_sector_pct`
   percent from its open, before `trend_day_pass_until`, a `trend` or
@@ -177,6 +198,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first rung (`min_rr` x R) moved out with it. Checked at load.
 
 ### Changed
+
+- **The daily history's depth is the strategy's (2026-11-10).**
+  `BaseStrategy.daily_history_calendar_days()` (180 unless a strategy
+  overrides it; swing_leader_pullback asks for what its 200-session SMA
+  needs) sets `MarketDataStore.daily_history_calendar_days` when the bot is
+  built, and every daily fetch of the run reaches that far back.
+  `get_daily_history` and `fetch_daily_history` no longer take a depth: the
+  frame is cached once per ET date, so the first fetch of the day fixed the
+  depth for every later caller, whatever it asked for.
 
 - **The key_levels preset's entry gates are retuned (2026-11-10).**
   `configs/config.peer_confirmed_key_levels.yaml`: `min_level_score` 2.9 to
