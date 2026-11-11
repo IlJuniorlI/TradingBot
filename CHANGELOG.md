@@ -61,10 +61,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (`CARRIED POSITION UNMANAGED`). Until then the account row was skipped
     and the saved row pruned as stale. A row whose last writer was a dry
     run is left out of this rule.
-  Not closed, and required before a live run: a stop moved in the app is
-  not followed while the bot runs (its replacement rests untracked, and its
-  fill is not seen), a gap older than this change that a
-  good-till-cancelled stop stretches from one session to the whole hold.
+  Left open by this entry, and closed on 2026-11-11 (the F-0004 entry under
+  "Fixed"): a stop moved in the app was not followed while the bot ran (its
+  replacement rested untracked, and its fill was not seen), a gap older
+  than this change that a good-till-cancelled stop stretched from one
+  session to the whole hold.
 
 - **A dry-run restart keeps the paper positions of a strategy that holds
   across sessions (2026-11-10).** A strategy declares the hold in its
@@ -347,6 +348,103 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sets the removed knob refuses to load, naming the gate.
 
 ### Fixed
+
+- **A post-close sweep still owed survives a restart (2026-11-11).** A
+  closed position's sweep whose read or cancel failed lived in memory only
+  (`PositionManager._sweeps_owed`). A restart forgot it, and the exit
+  order it was after then blocked every entry as an order the bot did not
+  own until it was cancelled by hand. The owed sweeps are now saved in the
+  state file when they change (a new `owed_exit_sweeps` table of
+  `startup_reconcile_metadata_db_path`, made by the first such write and
+  never by a read; a close whose sweep is done at once writes nothing) and
+  owed again by the next run before its startup reconcile
+  (`PositionManager.load_owed_sweeps`): the symbol takes no entry, the bot
+  cancels the leftover, and a reconcile that blocked on it runs once more
+  when the sweep is done.
+  - A sweep an earlier run owed reads the account before it cancels. In
+    the running bot a position opened in the symbol while the sweep was
+    owed keeps its stop, because the sweep skips what an open position
+    tracks; after a restart that position may not be tracked (mode `block`
+    restores nothing). While the account holds shares of the symbol on
+    that side beyond the ones the bot tracks, or cannot be read, the sweep
+    cancels nothing, stays owed, logs an ERROR and tries again a minute
+    later; every `disaster_stop_escalation_attempts`-th such try logs
+    `EXIT ORDERS LEFT` at CRITICAL.
+    A sweep this run owes for a symbol where an earlier run's is still
+    owed takes its place and its look at the account.
+  - A dry run owes no sweep, writes nothing and leaves a live run's rows
+    where they are. A row that does not read (its JSON, or a field) is
+    logged with its type and dropped, and the others are owed. A state
+    file that cannot be read at start-up owes none for now, at ERROR: it
+    is read again once a minute, nothing is written over it until it
+    reads, and a reconcile that blocked on working orders meanwhile runs
+    once more when the sweeps it then owes are done.
+  - While an open position in the symbol has a disaster stop whose outcome
+    is not known yet (an `unconfirmed` record, which names no order), a
+    sweep, a restarted one and the running bot's alike, leaves the exit
+    `STOP`s resting at exactly the price and size that record sent
+    (`broker_payloads.sent_exit_stops`) that the record can still take:
+    the ones entered since its submit when its own stop is listed, every
+    one when it is not (the record's placement then adopts one). Every
+    other exit order is still cancelled, and the sweep stays owed while
+    one is left. Until then the sweep cancelled that stop too, and a
+    fresh one was placed a pass later.
+  - `PositionManager` takes the state store (`reconcile_metadata_store`).
+- **A position handed to the settle is settled alone, in every reconcile
+  mode (2026-11-11).** When a stop moved in the app left nothing resting
+  and shares were sold by orders the bot cannot book, the position was
+  handed to the whole broker reconcile. In mode `block` that reconcile,
+  run mid-session, counted the bot's own open positions and working stops
+  and blocked every entry for the rest of the day. With the reconcile off
+  or in mode `ignore` (which a live run can have with bracket orders) it
+  never ran, so the hand-off was refused and the position stayed held,
+  with no exit, until a restart. The engine now settles the handed
+  position by itself on the next pass
+  (`IntradayBot._maybe_settle_handed_positions`,
+  `StartupReconciler.settle_handed_positions`): the account is read, what
+  left it is booked `closed_outside_bot`, the position is cut to what is
+  held or dropped, and the hold is lifted. No other position is compared
+  with the account, nothing is restored and no entry block is set. A
+  position the settle's own follow hands over meanwhile is settled in the
+  same try. A try that fails is repeated 10 s after it ends, then at a
+  doubling interval up to 300 s, at ERROR; every
+  `disaster_stop_escalation_attempts`-th logs `POSITION HELD FOR SETTLE`
+  at CRITICAL. A position handed over during that wait is tried at once,
+  and a try that raises holds every handed position again.
+  The settle (the reconcile's too) now cuts or drops a position the moment
+  its outside close is booked, ahead of the risk manager's registration: a
+  raise in between failed the attempt with the position at its old size,
+  and the retry booked the same shares a second time.
+  `PositionManager.reconcile_wanted` is now `settle_wanted`, and a broker
+  reconcile no longer runs for it.
+- **Late entry fills on a position held for a moved stop send no resize
+  (2026-11-11).** While a position is held because its stop reads
+  `REPLACED` and the replacement is not found, the record still names the
+  replaced order. A resize sent to it was refused: an ERROR, and for a
+  disaster stop a miss toward `DISASTER STOP DEGRADED` that no stop's
+  failure earned. Nothing is sent now
+  (`PositionManager.late_fills_wait_for_replacement`); the record is
+  marked, and the stop is resized to the shares held on the first pass
+  after the hold, once. The pass that sizes a followed replacement clears
+  that mark, so the stop is not re-issued a second time at the size it
+  already rests.
+- **A disaster stop placed afresh keeps the price it was moved to
+  (2026-11-11).** A stop moved in the app was followed and its price kept
+  on the record, but every stop the bot placed afresh for the position
+  (after a partial exit, a cancel in the app, a refused resize, a restart)
+  went back to the bot's own level. The price a plain working stop rests
+  at, when it is not the one the bot sent, now becomes the position's
+  backup level (`disaster_stop_price`), with the bot's own kept beside it
+  (`disaster_stop_own_price`). A moved price the last price is already
+  through when a stop has to be placed gives way to the bot's own level
+  from then on, logged. A trailing stop's level and a bracket's stop are
+  not touched.
+- **A stop changed into a limit order says that no stop rests
+  (2026-11-11).** Such an order is tracked in the stop's place (an exit
+  cancels it first, its fill is booked), and the log said nothing of what
+  that means. An ERROR now names it when it is followed. The first time it
+  has to be cut down it is still re-issued as the bot's plain stop at the
+  old stop level, the owner's call.
 
 - **A tracked broker stop that reads REPLACED is followed (2026-11-11,
   F-0004).** Schwab does not edit an order: a stop moved in the app, or
