@@ -104,8 +104,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   edge: it missed one of the study's own rules (flat in 2015-19), and the
   stock list is today's survivors. `test_rule_parity.py` drives the rule
   over three names' bars and gets the study's 102 trades. The strategy
-  refuses to build with `schwab.dry_run: false`: the live path's resting
-  stop is a DAY order and a restart restores no multi-day position.
+  refuses to build with `schwab.dry_run: false`: when it landed, the live
+  path's resting stop was a DAY order and a restart restored no multi-day
+  position. The live path has been built since (the entry above) and the
+  refusal stays until its broker facts are checked by hand.
   Earnings are not avoided. New preset
   `configs/config.swing_leader_pullback.yaml`; the strategy's README has the
   rule, the measurement and what is not built.
@@ -278,6 +280,32 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first rung (`min_rr` x R) moved out with it. Checked at load.
 
 ### Changed
+
+- **The swing preset serves its own dashboard port, and the docs after the
+  overnight path (2026-11-11).** `configs/config.swing_leader_pullback.yaml`
+  sets `dashboard.port: 8766`: the strategy runs as a second bot beside a
+  day-trading one, every other preset serves 8765, and the second bot to
+  ask for a port in use starts with no dashboard (logged, not fatal). Its
+  state folder was already its own (`.logs_swing`). No other value moved.
+  The strategy's refusal to build live no longer says the live path is not
+  built: it names the broker facts and the sign-off it waits for, and
+  points at the README's "The live path (built, not enabled)". Docs brought
+  up to the code: the plugin guide says what `capabilities.holding` drives
+  in a live run and describes `daily_history_symbols` /
+  `daily_history_calendar_days`; the root README's capability note, the
+  `ignore` mode's note (a holding strategy's dry run still takes its paper
+  positions back), the state file's five tables (`unsettled_entry_orders`
+  and `owed_exit_sweeps` were missing), the day ledger's restart note, the
+  knob matrix's count (18 strategies) and two preset notes
+  (`time_stop_min_r`, the Bollinger table); the Linux guide's restart
+  paragraph (what each reconcile mode restores, the holding strategy's
+  dry-run exception), its `auto_exit_after_session` count and a new section
+  on running the swing preset as a second bot; `configs/README_PRESETS.md`
+  gains the key_levels retune and the swing preset; the start-times table's
+  top_tier row (entries to 13:00 since 2026-11-10, `min_ltf_bars` 30 closed
+  5m buckets since 2026-10-13, the first entry at 09:45); the example
+  config's `disaster_stop_escalation_attempts` comment names the three
+  other CRITICALs the count paces.
 
 - **The daily history's depth is the strategy's (2026-11-10).**
   `BaseStrategy.daily_history_calendar_days()` (180 unless a strategy
