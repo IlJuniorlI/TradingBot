@@ -348,6 +348,130 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A tracked broker stop that reads REPLACED is followed (2026-11-11,
+  F-0004).** Schwab does not edit an order: a stop moved in the app, or
+  resized by the bot with an answer that carried no new order id
+  (`replace_bracket_child`, `new_id_unknown`), ends as `REPLACED` and
+  lives on in a new order. The position's record kept the old id. The fill
+  reconcile read only that id (a REPLACED order is neither filled nor
+  dead), the cancel before an engine exit read it as down, so the exit
+  went out beside the replacement, and the replacement's fill was never
+  booked: the bot went on managing shares the account no longer held and
+  its next exit sold them short. A day-trading strategy had this for the
+  rest of one session; a good-till-cancelled disaster stop for the whole
+  hold. Shared code, so this changes every strategy with a live disaster
+  stop or bracket; a dry run reads no order state and is unchanged.
+  - *The fill reconcile follows it* (`PositionManager._follow_replaced_child`,
+    for a stop and a target alike), at the head of every management pass.
+    The replaced order's own unbooked fills are booked first, under the
+    record's booked-fills ledger. The replacement is the one its payload
+    names (`replacingOrderCollection`), else the one found among the
+    account's orders entered since the replaced order itself was
+    (`SchwabExecutor.replacement_of`,
+    `broker_payloads.moved_child_replacement`; the state rows carry
+    `entered_at` for it). That read is the same for every strategy: a
+    replacement cannot be older than the order it replaced. The record's
+    child id is re-pointed and saved; a replacement that was itself
+    replaced is followed in the same pass. The loop then treats the
+    replacement as the child it is: a fill is booked, one cancelled in the
+    app is retired and a fresh stop placed, the price it was moved to is
+    recorded and kept. One that rests more than the shares it should cover
+    is cut to them at once, beside a working exit order too
+    (`_size_followed_children`: re-issued as the bot's own order at the
+    level the record holds); a disaster stop followed outside the regular
+    session is cut by the first regular-session pass, and one whose resize
+    is refused is a miss its own retry takes up. One that rests fewer is
+    left as it was sized, logged, the record's `qty` saying what rests:
+    after a sale made by hand the bot's own count is too high until the
+    next broker reconcile, and a stop enlarged to it would rest more than
+    the account holds.
+  - *The unnamed lookup goes further than the exit follower's.* Exactly one
+    later order of its kind that is not dead is the replacement, as
+    before; a stop's kind takes in the trailing stops. Several, of which
+    one is not itself REPLACED, are a chain of changes made between two
+    looks, taken a link at a time. None that is not dead, and dead ones,
+    means nothing of it rests: the dead one is followed and retired (of
+    several, the one that filled; else the newest). No later order of its
+    kind at all means it was changed into another kind (a stop into a
+    limit order): the one exit order of another kind entered after it that
+    may still rest is followed. One that filled or died is never taken: it
+    cannot be told from a sale made by hand. Nothing is taken while a dead
+    later order of its kind filled shares the pick does not lead to.
+    Left out of every look: the ids the record left behind
+    (`replaced_order_ids`, the newest 20; an order replaced in the second
+    it was entered reads as entered no earlier than its own replacement),
+    the record's other orders and the position's working exit order.
+  - *While the replacement is not found* (none named and none or several
+    that fit, orders or a state that cannot be read) the position is held:
+    no exit, the close's force flatten included, and nothing placed, the
+    re-protect after a working exit settles too. Each such pass counts
+    once, logs at ERROR, and every
+    `execution.disaster_stop_escalation_attempts`-th logs `ORDER REPLACED
+    UNTRACKED` at CRITICAL, naming the symbol whose other exit orders to
+    cancel. The hold ends on the pass that finds the replacement, or reads
+    it cancelled, once every tracked child was read.
+  - *When nothing entered after it can still rest* (every later exit order
+    on the symbol for the side filled or died: `nothing_rests_after`,
+    `ReplacementLookup.gone`; an order of another kind counts only when
+    entered after the replaced order's second, since an exit of the bot's
+    own can share it) there is nothing to hold for. It is acted on once
+    the orders have said so for a minute from the first such read
+    (`_gone_long_enough`, `replacement_gone_since` on the record; the
+    position is held meanwhile, with one WARNING): a listing can run
+    behind an order's own state, and acted on at one read, a replacement
+    not listed yet got a second stop beside it. Then
+    (`_replaced_child_gone`): nothing sold, the record is retired like any
+    dead stop's and a fresh stop placed. Shares sold: which order replaced
+    it is not known, and one may be a sale made by hand, so nothing is
+    booked from them; the record drops the order (a bracket's other leg
+    stays tracked), the position is held (`settle_pending`), and the
+    engine runs the broker reconcile on its next pass
+    (`PositionManager.reconcile_wanted`), whose settle compares the
+    position with the account, books what left it and lifts the hold.
+    With the broker reconcile off (or mode `ignore`) the position is held
+    as one whose replacement is not found.
+  - *`cancel_bracket` no longer reads a REPLACED order as down.* The cancel
+    goes on to the replacement its payload names, and to that one's in
+    turn; one that names none leaves the cancel unconfirmed
+    (`replaced_replacement_unknown`), so the exit defers a pass and the
+    follow finds it. A lone protective stop is its own wrapper: the
+    record's wrapper id now moves with it when it is replaced (by the
+    bot's own replace, or by the follow), where it used to stay on the
+    REPLACED order.
+  - *The broker reconcile follows first* (`follow_replaced_children`, the
+    manager's, ahead of the settle and the foreign-order check). The
+    reconcile of a new day runs before the day's first management pass: a
+    stop moved the evening before was a foreign order to it, which blocked
+    the day's entries, and "clear them" meant cancelling the position's
+    only stop. A replacement's size is left to the next management pass:
+    the settle has yet to compare the position with the account.
+  - *A restart follows the saved stop too*
+    (`StartupReconciler._book_positions_closed_while_down`). A saved stop
+    that read REPLACED was taken to have filled nothing, and its
+    replacement's fill, the close itself, was never booked. Each order of
+    the chain now books its own unbooked fills, at its own price and on
+    its own fill's day. A link that cannot be read keeps the row and fails
+    the attempt; a replacement that is not found is named at ERROR and
+    what was read is booked.
+- **The bot's own stop for a position the account no longer holds is
+  cancelled at a restart (2026-11-11).** A position sold in the app while
+  the bot was down left its saved stop working. The row was pruned and the
+  stop stayed: a foreign order that blocked entries until it was cancelled
+  by hand, or, past the order lookback, a sell stop resting against a flat
+  account. The restart now cancels it, with what else the saved record
+  tracks, before it books anything, and books what it sold by the time it
+  was down. A cancel that is not confirmed keeps the row and fails the
+  attempt, so the retry cancels again. A record a dry run saved is never
+  cancelled: its ids are those of the real protection it stood for.
+- **A broker reconcile that blocked on a leftover order runs again once
+  the owed sweep has cancelled it (2026-11-11).** The post-close sweep is
+  tried once ahead of each reconcile. When that try failed, the reconcile
+  read the closed position's leftover as a foreign order, succeeded, and
+  was not run again that day, so entries stayed blocked though the sweep
+  cancelled the leftover a minute later. A reconcile that blocks on
+  `working_orders_present` while a sweep is owed now runs once more when
+  the sweeps are done (`IntradayBot._reconcile_after_sweeps`). A sweep
+  that never finishes keeps the block.
 - **A broker stop that filled on an earlier day while the bot was down is
   booked (2026-11-10).** At a live restart a saved position the account no
   longer holds is booked from its stop's own fill
