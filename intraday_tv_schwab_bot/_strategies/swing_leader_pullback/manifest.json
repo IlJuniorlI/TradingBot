@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "name": "swing_leader_pullback",
+  "type": "stock",
+  "strategy_module": "intraday_tv_schwab_bot._strategies.swing_leader_pullback.strategy",
+  "strategy_class": "SwingLeaderPullbackStrategy",
+  "screener_module": "intraday_tv_schwab_bot._strategies.swing_leader_pullback.screener",
+  "screener_class": "SwingLeaderPullbackScreener",
+  "entry_windows": [
+    [
+      "09:31",
+      "10:00"
+    ]
+  ],
+  "management_windows": [
+    [
+      "09:30",
+      "16:00"
+    ]
+  ],
+  "screener_windows": [
+    [
+      "09:00",
+      "10:00"
+    ]
+  ],
+  "params": {
+    "index_universe": [
+      "SYML:SP;SPX",
+      "SYML:NASDAQ;NDX"
+    ],
+    "min_universe_size": 300,
+    "leader_fraction": 0.1,
+    "min_price": 5.0,
+    "min_dollar_volume": 20000000.0,
+    "trend_sma": 200,
+    "rsi_length": 2,
+    "rsi_max": 10.0,
+    "atr_length": 14,
+    "stop_atr_mult": 2.0,
+    "exit_sma": 5,
+    "max_hold_sessions": 10,
+    "exit_check_time": "15:50"
+  }
+}

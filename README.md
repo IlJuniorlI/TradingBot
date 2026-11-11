@@ -32,6 +32,7 @@ See also:
 - `peer_confirmed_htf_pivots` — peer-confirmed higher-timeframe pivot S/R scalp strategy with switchable reclaim, rejection, and continuation entry families
 - `top_tier_adaptive` — multi-regime adaptive strategy for 25 mega-cap Tech / AI stocks with peer-breadth index confirmation and a correlation concentration guard; seven core regimes (trend, pullback, range, vol_squeeze, momentum, sr_scalp, vwap_reclaim) compete in a flat score-ordered build queue, plus a dedicated `orb` opening-range-breakout regime in the opening window. Setups are measured on closed 5m buckets, entries and exits on 1m bars (since 2026-10-13); the shipped preset runs range and orb off
 - `small_cap_squeeze` — long-only multi-regime small-cap "squeeze" strategy; a dynamic TradingView screener (low float 400K-20M, premarket gap ≥5% on heavy volume, RVOL ≥2) replaces the fixed list. Reuses the `top_tier_adaptive` engine (trend / momentum / vwap_reclaim only since the 2026-06-02 narrowing; ORB, sr_scalp, pullback, range and vol_squeeze off), 1-minute LTF, premarket/extended-hours eligible
+- `swing_leader_pullback` — daily-bar swing strategy: buys a momentum leader's short pullback (RSI(2) under 10 above the 200-session SMA) at the open and holds it for days, exiting on the bounce near a close, a 2 x ATR stop or the 10th session; its own index-universe screener; dry run only
 
 ### 0DTE ETF option strategies
 
@@ -163,6 +164,7 @@ Valid values:
 - `peer_confirmed_htf_pivots`
 - `top_tier_adaptive`
 - `small_cap_squeeze`
+- `swing_leader_pullback`
 
 Changing `strategy` switches the live strategy only. The standard example/main config is now a full runnable template and includes an explicit `strategies.<name>` block. Shipped full presets do the same so each preset is portable as a standalone runtime config. The selected top-level file is now the runtime authority for `strategies.<name>`.
 
@@ -1348,6 +1350,7 @@ Shipped (user decision, 2026-09-24):
 | `momentum_close` | `momentum` -> `momentum` | 1m | none | default |
 | `opening_range_breakout`, `microcap_gap_orb` | `orb` -> `orb` | 1m | none | default |
 | `rth_trend_pullback` | `pullback` -> `pullback` | 1m | none | default |
+| `swing_leader_pullback` | `pullback` -> `pullback` | 1m for the entry's price; the setup reads completed daily bars | none (its preset switches every shared entry knob off) | default |
 | `volatility_squeeze_breakout` | `vol_squeeze` -> `vol_squeeze` | 1m | none | default |
 | `mean_reversion`, `closing_reversal` | `reversal` -> `reversal` | 1m | none | default |
 | `microcap_pm_breakout` | `pm_breakout` -> `breakout` | 1m | none (divergence-only entries stay possible if the knob is switched on) | `strategy_priority_score`, w 0 |
@@ -2669,6 +2672,28 @@ Current code defaults:
 | `adaptive_runner_trigger_rr`      | `1.15`                                                                                 |
 | `force_flatten`                   | `{'long': true, 'short': true}`                                                        |
 
+### `swing_leader_pullback`
+
+Purpose: a daily-bar swing strategy, the only one that holds positions across sessions. It buys a momentum leader's short pullback at the open and sells the bounce near a later close. **Dry run only**: the strategy refuses to build with `schwab.dry_run: false`. The rule, its measurement (the 2026-11-10 swing study), how the bot differs from it and what is not built are in `intraday_tv_schwab_bot/_strategies/swing_leader_pullback/README.md`.
+
+Default windows:
+
+- `entry_windows`: `[['09:31', '10:00']]`
+- `management_windows`: `[['09:30', '16:00']]`
+- `screener_windows`: `[['09:00', '10:00']]`
+
+How it works:
+
+- **Screener**: every member of the `index_universe` indexes (the S&P 500 and the Nasdaq-100) from one TradingView query, ranked by 12-1 momentum `(1 + Perf.Y) / (1 + Perf.1M) - 1`; the top `leader_fraction` are LONG candidates. Fewer than `min_universe_size` rankable members, or a query that raises: none. The day's first list stands for the day, and the leaders are on the watchlist only from the screener window's start to the entry window's end.
+- **Setup**, on the last completed daily session: close above the `trend_sma`-session SMA, Wilder's RSI(`rsi_length`) under `rsi_max`, the last close at least `min_price` and the 20-session median dollar volume at least `min_dollar_volume`. Refused when the daily bars are missing, failed today, not fetched yet today or do not end on the last completed session.
+- **Entry**: LONG at the 1m price in the entry window, one entry a session per symbol, the most oversold first. The stop is `stop_atr_mult` x the `atr_length`-session ATR under the entry; no target.
+- **Exit**: the engine's stop, or the strategy's check from `exit_check_time` on (that long before the session's close): the price above the `exit_sma`-close SMA, today's included, or the `max_hold_sessions`-th session after the entry's. It never force-flattens.
+- **Daily history**: the engine fetches `BaseStrategy.daily_history_calendar_days()` calendar days of daily bars (180 by default; this strategy asks for what its trend SMA needs, 328 for 200 sessions), one depth for the run.
+
+The preset turns off everything that would close a multi-day position or move its stop: `risk.trade_management_mode: none`, the peak giveback, the time stop, every `shared_entry` veto, refinement and score term, every `shared_exit` family, intraday S/R, extended hours and `auto_exit_after_session`. The strategy does not read the event calendar: earnings are not avoided.
+
+Strategy-specific knobs: `index_universe`, `min_universe_size`, `leader_fraction`, `min_price`, `min_dollar_volume`, `trend_sma`, `rsi_length`, `rsi_max`, `atr_length`, `stop_atr_mult`, `exit_sma`, `max_hold_sessions`, `exit_check_time`. All are checked at load.
+
 ### `zero_dte_etf_options`
 
 Purpose: 0DTE ETF strategy that can trade debit spreads and, when enabled, midday credit spreads.
@@ -2878,6 +2903,7 @@ Shipped preset files:
 | `configs/config.peer_confirmed_htf_pivots.yaml` | `peer_confirmed_htf_pivots`           |
 | `configs/config.top_tier_adaptive.yaml`         | `top_tier_adaptive`                   |
 | `configs/config.small_cap_squeeze.yaml`         | `small_cap_squeeze`                   |
+| `configs/config.swing_leader_pullback.yaml`     | `swing_leader_pullback`               |
 | `configs/config.zero_dte_etf_options.yaml`      | `zero_dte_etf_options`                |
 | `configs/config.zero_dte_etf_long_options.yaml` | `zero_dte_etf_long_options`           |
 

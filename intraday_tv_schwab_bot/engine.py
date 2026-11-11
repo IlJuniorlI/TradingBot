@@ -395,6 +395,14 @@ class IntradayBot:
         self.session_risk_state_store = SessionRiskStateStore(config.runtime.startup_reconcile_metadata_db_path)
         self.risk = RiskManager(config, state_store=self.session_risk_state_store)
         self.strategy: BaseStrategy = build_strategy(config)
+        # The daily history's depth is the strategy's
+        # (``BaseStrategy.daily_history_calendar_days``, 2026-11-10): one
+        # value for the run, since a symbol's frame is cached per ET date.
+        daily_days = self.strategy.daily_history_calendar_days()
+        if isinstance(daily_days, bool) or not isinstance(daily_days, int) or daily_days < 1:
+            raise ValueError(f"{type(self.strategy).__name__}.daily_history_calendar_days() must be a whole number "
+                             f">= 1, got {daily_days!r}")
+        self.data.daily_history_calendar_days = daily_days
         # The account's day figures (its day ledger) persist in the same
         # file too, in a table of their own: a restart carries on the day's
         # P&L, realized P&L, trade statistics, drawdown and curve, checked

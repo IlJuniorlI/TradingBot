@@ -90,6 +90,12 @@ DISPLAY_PRICE_KEYS = ("last", "mark", "mid", "close", "bid", "ask")
 # from the window on it stays cached for the day.
 DAILY_HISTORY_RETRY_SECONDS = 60.0
 
+# Calendar days of daily history a fetch asks for unless the strategy needs
+# more (``BaseStrategy.daily_history_calendar_days``, which the engine copies
+# to ``MarketDataStore.daily_history_calendar_days`` when it builds the bot):
+# about 124 sessions, what top_tier's ADR and beta read.
+DAILY_HISTORY_CALENDAR_DAYS = 180
+
 # An HTF bar counts as closed on Schwab's side this long after its boundary
 # (``MarketDataStore.htf_refresh_due``): time for the broker to aggregate it.
 HTF_SETTLE_SECONDS = 10.0
@@ -492,6 +498,11 @@ class MarketDataStore:
         # get_daily_history). A None value is a cached failure for that
         # date, not "not fetched yet" — last_daily_refresh distinguishes.
         self.daily_history: dict[str, pd.DataFrame | None] = {}
+        # How far back a daily fetch reaches, in calendar days: the same for
+        # every symbol and every fetch of the run, since the frame is cached
+        # once per ET date (2026-11-10; until then each call named its own
+        # depth and the first fetch of the day fixed it for the rest).
+        self.daily_history_calendar_days: int = DAILY_HISTORY_CALENDAR_DAYS
         self.last_daily_refresh: dict[str, date] = {}
         # When today's fetch of a symbol raised, while no later fetch has
         # answered (daily_history_due retries it).
@@ -2002,10 +2013,10 @@ class MarketDataStore:
         with self._lock:
             return self.last_daily_refresh.get(key) == sessions.now_et().date() and key in self.daily_history_failed_at
 
-    def get_daily_history(self, symbol: str, calendar_days: int = 180) -> pd.DataFrame | None:
+    def get_daily_history(self, symbol: str) -> pd.DataFrame | None:
         """Daily OHLC bars for *symbol*: what ``fetch_daily_history`` stored
         for today's ET date (in memory; a new date fetches again), fetched
-        now when it has not run today.
+        now when it has not run today. ``daily_history_calendar_days`` back.
 
         Feeds ``daily_stats`` (per-symbol ADR scale + benchmark beta), which
         needs a horizon the intraday store cannot provide — ``history`` spans
@@ -2023,11 +2034,12 @@ class MarketDataStore:
             if self.last_daily_refresh.get(key) == sessions.now_et().date():
                 cached = self.daily_history.get(key)
                 return None if cached is None else cached.copy()
-        return self.fetch_daily_history(symbol, calendar_days)
+        return self.fetch_daily_history(symbol)
 
-    def fetch_daily_history(self, symbol: str, calendar_days: int = 180) -> pd.DataFrame | None:
+    def fetch_daily_history(self, symbol: str) -> pd.DataFrame | None:
         """Fetch *symbol*'s daily OHLC bars now (one Schwab ``price_history``
-        call) and store them for today's ET date; returns them, or ``None``.
+        call, ``daily_history_calendar_days`` back) and store them for
+        today's ET date; returns them, or ``None``.
 
         A payload whose candles do not read is a failed fetch; until
         2026-09-26 its error escaped uncached, so the fetch was retried every
@@ -2051,7 +2063,7 @@ class MarketDataStore:
         key = self._symbol_key(symbol)
         now = sessions.now_et()
         today = now.date()
-        start = now - timedelta(days=max(1, int(calendar_days)))
+        start = now - timedelta(days=self.daily_history_calendar_days)
         try:
             payload, source_symbol = self._fetch_price_history_payload_with_aliases(
                 symbol,

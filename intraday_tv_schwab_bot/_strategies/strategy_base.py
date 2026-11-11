@@ -1139,6 +1139,13 @@ class BaseStrategy(ContextBuildersMixin):
     def entry_signals(self, candidates: list[Candidate], bars: dict[str, pd.DataFrame], positions: dict[str, Position], client=None, data=None) -> list[Signal]:
         raise NotImplementedError
 
+    def daily_history_calendar_days(self) -> int:
+        """Calendar days of daily history this strategy's reads need
+        (``MarketDataStore.get_daily_history``): the engine sets the store's
+        depth from it when it builds the bot. 180, about 124 sessions, unless
+        a strategy overrides it (swing_leader_pullback's 200-session SMA)."""
+        return 180
+
     def daily_history_symbols(self, watchlist: list[str]) -> list[str]:
         """Symbols whose daily history (``MarketDataStore.get_daily_history``)
         this strategy's entries read, given the cycle's watchlist: the engine

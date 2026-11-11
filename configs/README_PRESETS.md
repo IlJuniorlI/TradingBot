@@ -48,6 +48,7 @@ Legend: 1 = on, 0 = off. `tstop` is `risk.time_stop_minutes`, `prox` is `support
 | `microcap_pm_breakout` | 1 | **1** | 1 | 1 | 0 | 0 | **1** | 0 | **1** | **1** | 1 | 30 | 1 | 0 | 1 |
 | `zero_dte_etf_options` | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 45 | 1 | 0 | 0 |
 | `zero_dte_etf_long_options` | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 1 | 0 | 0 | 0 | 45 | 1 | 0 | 0 |
+| `swing_leader_pullback` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 
 Bold cells are the user-decision flips. Some other cells differ from the old YAML because of parity:
 

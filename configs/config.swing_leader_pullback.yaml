@@ -1,0 +1,504 @@
+# swing_leader_pullback: buy a momentum leader's short pullback at the open and
+# hold it for days (the strategy's README has the rule and its measurement).
+# DRY RUN ONLY: the strategy refuses to build with schwab.dry_run false.
+#
+# What makes this preset a swing preset, each explained where it is set:
+#   risk.trade_management_mode none, peak giveback off, time stop off,
+#   every shared_entry veto / refinement / score term off, the shared_exit
+#   families off, execution.extended_hours_enabled false,
+#   runtime.auto_exit_after_session false.
+# Put SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_ACCOUNT_HASH and SCHWAB_ENCRYPTION_KEY in a .env file at the repo root.
+strategy: swing_leader_pullback
+schwab:
+  callback_url: https://127.0.0.1
+  tokens_db: .schwabdev/tokens.db
+  timeout: 10
+  dry_run: true
+  open_browser_for_auth: true
+tradingview:
+  market: america
+  max_candidates: 10
+  screener_refresh_seconds: 60
+  # The five filters below are the shared screener helpers'. This strategy's
+  # screener applies none of them: its universe is the members of
+  # strategies.swing_leader_pullback.params.index_universe.
+  min_market_cap: 30000000
+  max_market_cap: 2000000000
+  min_volume: 550000
+  min_value_traded_1m: 100000.0
+  min_volume_1m: 8000
+paper:
+  # Ten slots of max_notional_per_trade.
+  starting_equity: 50000.0
+  max_equity_points: 2000
+  equity_point_seconds: 15
+  max_trade_history: 200
+risk:
+  # The study's book: at most ten positions, equal slices, the most oversold
+  # first (the strategy's score).
+  max_positions: 10
+  # The stop sits 2 daily ATRs under the entry, about 6% of the price on the
+  # leaders this trades. At 0.06 a slice is filled whole when the stop is no
+  # wider than 6% and cut down in proportion when it is wider, so a stop-out
+  # costs at most about 6% of a slice.
+  risk_per_trade_frac_of_notional: 0.06
+  max_notional_per_trade: 5000.0
+  max_total_notional: 50000.0
+  # Open risk to the stops counts against it (daily_loss_includes_open_risk),
+  # and the positions are carried, so it must hold ten slices' risk (10 x 300)
+  # or the book could never fill.
+  max_daily_loss: 3500.0
+  # Not this strategy's levels (its stop is 2 daily ATRs, no target): the
+  # fallback the entry stage books when a fill lands beyond the signal's own.
+  default_stop_pct: 0.018
+  default_target_pct: 0.038
+  trailing_stop_pct: 0.014
+  trail_activation_r: 0.5
+  # none: no break-even, profit lock, runner or trail. The exits are the
+  # stop and the strategy's own close-time exit.
+  trade_management_mode: none
+  allow_short: false
+  # Longer than a session: a symbol stopped out is not bought again the same
+  # day on the same setup.
+  cooldown_minutes: 480
+  reentry_policy: cooldown
+  cooldown_direction_aware: true
+  same_level_block_minutes: 30
+  same_level_block_atr_mult: 0.3
+  # Off: it counts wall-clock minutes, nights included.
+  time_stop_minutes: 0
+  time_stop_min_return_pct: 0.003
+  time_stop_min_r: 0.3
+  entry_min_target_rr_at_limit: 1.0
+  # Off: the rule sells the bounce at the close, not a retrace from a peak.
+  peak_giveback_enabled: false
+  peak_giveback_min_r: 1.0
+  peak_giveback_low_tier_enabled: false
+  peak_giveback_low_tier_min_r: 0.7
+  peak_giveback_low_tier_giveback_frac: 0.7
+  peak_giveback_retain_1to2r: 0.65
+  peak_giveback_retain_2to3r: 0.72
+  peak_giveback_retain_3r_plus: 0.78
+  entry_slippage_allowance_spread_frac: 1.0
+  entry_slippage_allowance_max_pct: 0.002
+  risk_overage_warn_frac: 0.15
+  entry_slippage_warn_pct: 0.0015
+  daily_loss_includes_open_risk: true
+runtime:
+  loop_sleep_seconds: 2.0
+  error_escalation_cycles: 10
+  schwab_login_warning_hours: 24
+  history_poll_seconds: 300
+  quote_poll_seconds: 6
+  quote_cache_seconds: 6
+  stream_quotes: true
+  stream_quote_shadow_every: 20
+  quote_batch_size: 50
+  history_lookback_minutes: 780
+  use_extended_hours_history: true
+  use_rth_session_indicators: true
+  equity_session_indicator_window: rth
+  warmup_minutes: 150
+  prewarm_before_windows_minutes: 15
+  log_dir: .logs
+  stream_fields:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  stream_connect_timeout_seconds: 20
+  stream_fallback_poll_seconds: 25
+  stream_stale_fallback_seconds: 180
+  stream_health_log_seconds: 90
+  # false: the process must stay up to carry positions (a dry-run restart
+  # restores no paper position).
+  auto_exit_after_session: false
+  idle_sleep_seconds: 60.0
+  symbol_state_prune_seconds: 1800.0
+  session_reconcile_on_resume: true
+  cycle_fetch_workers: 4
+  max_consecutive_quote_failures: 5
+  context_memo_shadow_every: 20
+  export_session_archive: true
+  log_position_marks: true
+  reconcile_on_startup: true
+  # A dry run's positions are not in the broker account, so there is nothing
+  # to reconcile against.
+  startup_reconcile_mode: ignore
+  startup_order_lookback_days: 2
+  startup_reconcile_ignore_symbols: []
+  startup_reconcile_metadata_db_path: .logs/startup_reconcile_metadata.sqlite
+execution:
+  entry_limit_min_buffer: 0.03
+  entry_limit_max_buffer: 0.05
+  entry_limit_spread_frac: 0.1
+  entry_live_fill_timeout_seconds: 2.0
+  entry_live_poll_seconds: 0.25
+  entry_live_reprice_attempts: 2
+  entry_live_reprice_step_frac: 0.33
+  # false: entries and exits in the regular session only. The stop of a
+  # position that gaps overnight is judged at the open, as the study filled
+  # it, not on a 07:00 premarket quote.
+  extended_hours_enabled: false
+  market_exit_regular_hours: false
+  exit_live_reprice_attempts: 2
+  exit_live_reprice_step_frac: 0.5
+  exit_live_reprice_max_seconds: 12.0
+  exit_live_market_fallback: false
+  bracket_orders_enabled: false
+  bracket_sync_mode: static
+  bracket_legs: stop_and_target
+  bracket_stop_order_type: STOP
+  bracket_stop_limit_offset_r: 0.5
+  bracket_require_normal_session: true
+  bracket_replace_min_price_delta: 0.01
+  disaster_stop_enabled: true
+  disaster_stop_r: 1.0
+  disaster_stop_min_pct: 0.0025
+  disaster_stop_escalation_attempts: 3
+candles:
+  bullish_patterns:
+  - bullish_1c
+  - bullish_2c
+  - bullish_3c
+  bearish_patterns:
+  - bearish_1c
+  - bearish_2c
+  - bearish_3c
+  opposing_net_score_threshold: 0.7
+chart_patterns:
+  enabled: true
+  lookback_bars: 32
+  bullish_patterns:
+  - bullish_double_bottom
+  - bullish_inverse_head_and_shoulders
+  - bullish_falling_wedge
+  - bullish_broadening_bottom
+  - bullish_triple_bottom
+  - bullish_flag
+  - bullish_pennant
+  - bullish_ascending_triangle
+  - bullish_symmetrical_triangle
+  bearish_patterns:
+  - bearish_double_top
+  - bearish_head_and_shoulders
+  - bearish_rising_wedge
+  - bearish_broadening_top
+  - bearish_triple_top
+  - bearish_flag
+  - bearish_pennant
+  - bearish_descending_triangle
+  - bearish_symmetrical_triangle
+dashboard:
+  enabled: true
+  host: 127.0.0.1
+  port: 8765
+  refresh_ms: 1500
+  state_path: .logs/dashboard_state.json
+  client_idle_seconds: 30.0
+  idle_publish_seconds: 60.0
+  state_write_seconds: 30
+  theme: default
+  https: false
+  ssl_certfile: ''
+  ssl_keyfile: ''
+  charting:
+    compact_chart_timeframe: ltf
+    compact:
+      max_bars: 90
+      show_volume: false
+      show_moving_averages: true
+      show_vwap: true
+      show_support_resistance: true
+      show_next_support_resistance: true
+      show_full_support_resistance_ladder: false
+      show_key_level_zones: true
+      show_key_level_zone_labels: true
+      show_bollinger_bands: false
+      show_anchored_vwap: false
+      show_fib_extensions: false
+      show_fib_retracements: false
+      show_channel: false
+      show_trendlines: false
+      show_htf_fair_value_gaps: false
+      show_ltf_fair_value_gaps: false
+      show_htf_order_blocks: false
+      show_ltf_order_blocks: false
+      show_rsi_divergence: true
+      show_obv_divergence: false
+      show_trade_markers: true
+      tooltip_show_returns: true
+      tooltip_show_support_resistance: true
+      tooltip_show_structure: true
+      tooltip_show_volatility: true
+      tooltip_show_orderflow: true
+      tooltip_show_patterns: true
+    expanded:
+      max_bars: 360
+      show_volume: true
+      show_moving_averages: true
+      show_vwap: true
+      show_support_resistance: true
+      show_next_support_resistance: true
+      show_full_support_resistance_ladder: true
+      show_key_level_zones: true
+      show_key_level_zone_labels: true
+      show_bollinger_bands: true
+      show_anchored_vwap: true
+      show_fib_extensions: true
+      show_fib_retracements: true
+      show_channel: false
+      show_trendlines: false
+      show_htf_fair_value_gaps: false
+      show_ltf_fair_value_gaps: false
+      show_htf_order_blocks: false
+      show_ltf_order_blocks: false
+      show_rsi_divergence: true
+      show_obv_divergence: false
+      show_trade_markers: true
+      tooltip_show_returns: true
+      tooltip_show_support_resistance: true
+      tooltip_show_structure: true
+      tooltip_show_volatility: true
+      tooltip_show_orderflow: true
+      tooltip_show_patterns: true
+support_resistance:
+  # Off: nothing this strategy runs reads intraday S/R (every shared entry
+  # and exit knob is off), and on it would fetch an HTF frame and build a
+  # context for each of about fifty leaders every cycle.
+  enabled: false
+  timeframe_minutes: 15
+  lookback_days: 10
+  pivot_span: 2
+  max_levels_per_side: 4
+  atr_tolerance_mult: 0.6
+  pct_tolerance: 0.003
+  same_side_min_gap_atr_mult: 0.1
+  same_side_min_gap_pct: 0.0015
+  fallback_reference_max_drift_atr_mult: 1.0
+  fallback_reference_max_drift_pct: 0.01
+  proximity_atr_mult: 0.7
+  breakout_atr_mult: 0.3
+  breakout_buffer_pct: 0.0012
+  stop_buffer_atr_mult: 0.25
+  entry_min_clearance_atr: 0.72
+  entry_min_clearance_pct: 0.0025
+  entry_proximity_scoring_enabled: false
+  entry_bias_score_weight: 0.5
+  entry_favorable_proximity_bonus: 0.3
+  entry_opposing_proximity_penalty: 0.3
+  use_prior_day_high_low: true
+  use_prior_week_high_low: true
+  htf_fair_value_gaps_enabled: true
+  fair_value_gap_max_per_side: 3
+  fair_value_gap_min_atr_mult: 0.06
+  fair_value_gap_min_pct: 0.0006
+  ltf_fair_value_gaps_enabled: true
+  ltf_order_blocks_enabled: false
+  htf_order_blocks_enabled: false
+  order_block_mode: loose
+  order_block_max_per_side: 4
+  order_block_min_atr_mult: 0.05
+  order_block_min_pct: 0.0005
+  order_block_min_thrust_atr_mult: 0.75
+  order_block_pivot_span: 2
+  order_block_new_high_lookback: 8
+  trading_flip_confirmation_1m_bars: 2
+  trading_flip_confirmation_5m_bars: 1
+  flip_stop_buffer_atr_mult: 0.25
+  flip_target_requires_momentum_confirm: true
+  regime_weight: 0.7
+  structure_enabled: true
+  structure_ltf_pivot_span: 2
+  structure_eq_atr_mult: 0.25
+  structure_ltf_weight: 0.65
+  structure_htf_weight: 0.95
+  structure_event_lookback_bars: 8
+  htf_structure_event_lookback_bars: null
+  structure_min_pivot_gap_bars: 0
+  structure_ltf_timeframe_minutes: 0
+  structure_min_range_atr_mult: 1.5
+  structure_exit_grace_minutes: 10
+  structure_exit_min_post_entry_pivots: 2
+  structure_exit_grace_minutes_pullback: 15
+  structure_exit_require_bos_confirmation: true
+  orb_entry_exit_grace_minutes: 20
+technical_levels:
+  enabled: true
+  fib_enabled: true
+  fib_lookback_bars: 120
+  fib_min_impulse_atr: 1.25
+  fib_near_extension_pct: 0.0055
+  anchored_vwap_impulse_lookback_bars: null
+  anchored_vwap_min_impulse_atr: null
+  anchored_vwap_pivot_span: null
+  channel_enabled: false
+  channel_lookback_bars: 120
+  channel_min_touches: 3
+  channel_atr_tolerance_mult: 0.35
+  channel_parallel_slope_frac: 0.12
+  channel_min_gap_atr_mult: 0.8
+  channel_min_gap_pct: 0.0025
+  channel_near_edge_pct: 0.16
+  trendline_enabled: false
+  trendline_lookback_bars: 120
+  trendline_min_touches: 3
+  trendline_atr_tolerance_mult: 0.35
+  trendline_breakout_buffer_atr_mult: 0.3
+  adx_enabled: true
+  adx_length: 14
+  adx_min_strength: 18.0
+  adx_entry_bonus: 0.2
+  adx_rising_bonus: 0.08
+  adx_weak_penalty: 0.12
+  anchored_vwap_enabled: false
+  anchored_vwap_entry_bonus: 0.2
+  anchored_vwap_entry_penalty: 0.18
+  atr_context_enabled: true
+  atr_expansion_lookback: 5
+  atr_expansion_min_mult: 0.8
+  atr_expansion_bonus: 0.12
+  atr_stretch_penalty_mult: 2.6
+  atr_stretch_penalty: 0.2
+  obv_enabled: true
+  obv_ema_length: 20
+  obv_entry_bonus: 0.1
+  obv_entry_penalty: 0.08
+  divergence_enabled: true
+  divergence_rsi_length: 14
+  divergence_rsi_min_delta: 2.5
+  divergence_obv_min_volume_frac: 0.65
+  divergence_counter_rsi_penalty: 0.12
+  divergence_counter_obv_penalty: 0.1
+  divergence_pivot_lookback: 4
+  divergence_max_age_bars: 8
+  htf_divergence_max_age_bars: 6
+  divergence_min_price_move_pct: 0.0015
+  divergence_hidden_bonus_rsi: 0.1
+  divergence_hidden_bonus_obv: 0.08
+  htf_divergence_aligned_bonus_rsi: 0.2
+  htf_divergence_counter_penalty_rsi: 0.25
+  htf_divergence_hidden_bonus_rsi: 0.1
+  bollinger_enabled: true
+  bollinger_length: 20
+  bollinger_std_mult: 2.0
+  bollinger_squeeze_width_pct: 0.0061
+  bollinger_entry_bonus_midband: 0.16
+  bollinger_entry_penalty_outer_band: 0.22
+  target_use_bollinger: false
+  target_use_fib: true
+  target_use_channel: true
+  target_use_trendline: true
+  stop_use_trendline: true
+  entry_bonus_channel_alignment: 0.2
+  entry_bonus_trendline_respect: 0.2
+  entry_penalty_near_extension: 0.4
+shared_entry:
+  use_fvg_context: false
+  use_dual_divergence_veto: false
+  use_htf_divergence_score: false
+  use_divergence_entry_signal: false
+  divergence_entry_min_age_bars: 0
+  divergence_entry_require_sr_confluence: true
+  divergence_entry_score_floor: 1.5
+  divergence_entry_score_bump: 0.2
+  use_technical_entry_adjustment: false
+  use_technical_stop_target_refinement: false
+  use_structure_filter: false
+  use_sr_filter: false
+  use_sr_stop_target_refinement: false
+  use_broken_level_guard: false
+  broken_level_min_clearance_pct: 0.0025
+  broken_level_min_clearance_atr: 0.72
+  use_opposing_chart_filter: false
+  use_opposing_candle_filter: false
+  min_target_rr: 1.0
+  min_stop_atr_mult: 1.5
+  min_shared_context_score: null
+shared_exit:
+  use_technical_exit: false
+  use_trendline_break: true
+  use_channel_break: true
+  use_bollinger_reject: false
+  use_anchored_vwap_loss: true
+  anchored_vwap_exit_require_two_bar_confirm: true
+  use_chart_pattern_exit: false
+  use_candle_pattern_exit: false
+  use_structure_exit: false
+  use_sr_loss_exit: false
+  discretionary_exit_min_r: 0.5
+  adaptive_ladder_touch_hold: false
+  adaptive_ladder_touch_hold_timeout_seconds: 45.0
+  use_divergence_exit_signal: false
+  divergence_exit_partial_frac: 0.5
+  divergence_exit_min_age_bars: 1
+  divergence_exit_require_in_profit: true
+  confirm_with_ema9: true
+  confirm_with_ema20: true
+  confirm_with_vwap: true
+  confirm_with_close_position: true
+  bullish_close_position_max: 0.46
+  bearish_close_position_min: 0.54
+  bullish_close_position_loose_max: 0.38
+  bearish_close_position_loose_min: 0.62
+# This strategy does not read the event calendar: a hold can span an
+# earnings report, as the study's trades did (its README, "What is not
+# built").
+events:
+  enabled: true
+  blackout_file: ./macro_events.auto.yaml
+  blackouts: []
+  earnings_file: ./earnings.yaml
+  earnings: {}
+  earnings_block_sessions_before: 1
+  earnings_block_sessions_after: 1
+strategies:
+  swing_leader_pullback:
+    # Entries near the open only: the rule buys the session after the setup
+    # at its open. A start after 10:00 skips the day's setups.
+    entry_windows:
+    - - 09:31
+      - '10:00'
+    management_windows:
+    - - 09:30
+      - '16:00'
+    # From 09:00: the leaders' 1m and daily history is fetched before the
+    # open, not in one burst at the first entry pass. The rank does not move
+    # with the session, so an early screen is the same screen.
+    screener_windows:
+    - - 09:00
+      - '10:00'
+    params:
+      # The universe the leaders are ranked in: TradingView index ids.
+      index_universe:
+      - SYML:SP;SPX
+      - SYML:NASDAQ;NDX
+      # Fewer rankable members than this in the screener's answer: no leaders.
+      min_universe_size: 300
+      # The top tenth by 12-1 momentum.
+      leader_fraction: 0.1
+      # Floors read on the daily bars: the last close and the 20-session
+      # median of close x volume.
+      min_price: 5.0
+      min_dollar_volume: 20000000.0
+      # The setup, on the last completed session: close above the 200-session
+      # SMA, RSI(2) under 10.
+      trend_sma: 200
+      rsi_length: 2
+      rsi_max: 10.0
+      # The stop: 2 x the 14-session ATR under the entry.
+      atr_length: 14
+      stop_atr_mult: 2.0
+      # The exits near the close: the price above the 5-session SMA (today
+      # included), or the 10th session after the entry's.
+      exit_sma: 5
+      max_hold_sessions: 10
+      # The exit check opens this long before the session's close (10
+      # minutes; an early-close day checks 10 minutes before its own close).
+      exit_check_time: '15:50'
+pairs: []
