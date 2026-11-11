@@ -509,6 +509,12 @@ class IntradayBot:
         # Failed attempts in a row that left a position held
         # (``settle_pending``); see _reconcile_retry_delay.
         self._settle_hold_failures = 0
+        # The last successful reconcile blocked entries on working orders no
+        # position owns while a closed position's post-close sweep was still
+        # owed: the leftover that sweep cancels may be all it blocked on, so
+        # the reconcile runs once more when the sweeps are done
+        # (_maybe_session_reconcile).
+        self._reconcile_after_sweeps = False
         self._last_reconcile_attempt_monotonic: float = 0.0
         # The ended ET days this process still owes a close, oldest first
         # when closed: the SESSION REPORT summary, the append of its trades
@@ -632,6 +638,7 @@ class IntradayBot:
             reconcile_metadata_store=self.reconcile_metadata_store,
             save_reconcile_metadata=self._save_reconcile_metadata,
             book_bracket_cancel_fills=self.position_manager.book_bracket_cancel_fills,
+            follow_replaced_children=self.position_manager.follow_replaced_children,
             settle_unsettled_entry_orders=self.entry_gatekeeper.settle_unsettled_entry_orders,
             unsettled_entry_order_ids=self.entry_gatekeeper.unsettled_entry_order_ids,
         )
@@ -1215,6 +1222,22 @@ class IntradayBot:
         `session_reconcile_on_resume: false`, which disables only the new-day
         reconcile.
 
+        A reconcile that succeeded but blocked entries on working orders no
+        position owns, while a closed position's post-close sweep was still
+        owed, runs once more when those sweeps are done (2026-11-11). The
+        sweep's one try ahead of the reconcile can fail (a read or a cancel
+        the broker did not confirm); the reconcile then read the leftover
+        as a foreign order and, having succeeded, was not run again that
+        day, so entries stayed blocked though the sweep cancelled the
+        leftover a minute later. A sweep that never finishes keeps the
+        block: its order is still there.
+
+        The position manager asks for a run too (``reconcile_wanted``) when
+        it hands a position to the settle: a REPLACED stop left nothing
+        resting and shares were sold by orders the record cannot tell
+        apart, so only the account says what is held
+        (``PositionManager._replaced_child_gone``).
+
         Disable the new-day reconcile via `runtime.session_reconcile_on_resume: false`.
         """
         # Honor the same gate the startup reconcile honors.
@@ -1223,7 +1246,11 @@ class IntradayBot:
         if self.config.runtime.startup_reconcile_mode == "ignore":
             return
         retrying = self._reconcile_failures > 0
-        if not retrying and not self.config.runtime.session_reconcile_on_resume:
+        # A reconcile owed a second run by the post-close sweeps, or asked
+        # for by the position manager (a position handed to the settle).
+        swept = self._reconcile_after_sweeps and not self.position_manager.exit_sweep_symbols()
+        again = swept or self.position_manager.reconcile_wanted
+        if not (retrying or again) and not self.config.runtime.session_reconcile_on_resume:
             return
         now = sessions.now_et()
         state = equity_session_state(
@@ -1246,6 +1273,12 @@ class IntradayBot:
                     time.monotonic() - self._last_reconcile_attempt_monotonic < self._reconcile_retry_delay():
                 return
             LOG.info("Retrying the failed broker reconcile")
+        elif again:
+            LOG.info("Broker reconcile again: %s",
+                     "it blocked entries on working orders while a post-close sweep was still owed, and the "
+                     "sweeps are done" if swept else
+                     "a position is held for its settle (a REPLACED stop left nothing resting, and shares were "
+                     "sold by orders the record does not track)")
         elif self._last_reconcile_session_date == today:
             return
         else:
@@ -1273,6 +1306,9 @@ class IntradayBot:
             self.startup_reconciler.restore_paper_positions()
             self._paper_restore_pending = False
         ok = self.startup_reconciler.reconcile()
+        # Asked for or not, the reconcile has run; a failed one is retried
+        # as any failed attempt is.
+        self.position_manager.reconcile_wanted = False
         # The retry delay runs from the END of the attempt, so an attempt that
         # hangs for longer than the delay is not re-fired at once.
         self._last_reconcile_attempt_monotonic = time.monotonic()
@@ -1280,6 +1316,9 @@ class IntradayBot:
             self._last_reconcile_session_date = session_date
             self._reconcile_failures = 0
             self._settle_hold_failures = 0
+            self._reconcile_after_sweeps = (
+                self.startup_reconciler.trading_blocked_reason == "working_orders_present"
+                and bool(self.position_manager.exit_sweep_symbols()))
             # The day's row's positions this reconcile did not restore leave
             # the row, each logged with the move it leaves in the day's P&L
             # (after the first success, there are none).

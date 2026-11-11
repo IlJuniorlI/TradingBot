@@ -13,7 +13,9 @@ from schwabdev import Client
 
 from .broker_payloads import (
     BRACKET_ID_KEYS,
+    BRACKET_REPLACED_IDS_KEY,
     DISASTER_SYNC_MODE,
+    REPLACED_STATUS,
     STOP_ORDER_TYPES,
     booked_child_part,
     booked_fills_ledger,
@@ -24,6 +26,9 @@ from .broker_payloads import (
     extract_orders,
     flatten_order_tree,
     is_disaster_stop,
+    moved_child_replacement,
+    note_replaced_order,
+    nothing_rests_after,
     order_fill_price,
     order_fill_price_estimated,
     order_filled_qty,
@@ -114,6 +119,21 @@ def order_result_names_replacement(message: Any) -> bool:
 # fill price in, ``(stop, target, fallback_reason)`` out, the reason None when
 # the signal's levels still fit the fill (``EntryGatekeeper._post_fill_levels``).
 PostFillLevels = Callable[[float], tuple[float, float | None, str | None]]
+
+
+@dataclass(frozen=True, slots=True)
+class ReplacementLookup:
+    """What ``SchwabExecutor.replacement_of`` found of the order that
+    REPLACED a tracked protective order: its id when found, and how it was
+    found or why not. When none was found: ``unread`` when the orders could
+    not be read (a read to try again), ``gone`` when the orders show that
+    nothing entered after it can still rest, with ``sold``, the shares
+    those orders filled between them."""
+    order_id: str | None
+    how: str
+    unread: bool = False
+    gone: bool = False
+    sold: int = 0
 
 
 @dataclass(slots=True)
@@ -1246,6 +1266,53 @@ class SchwabExecutor:
         lookback = datetime.timedelta(days=int(self.config.runtime.startup_order_lookback_days))
         return self.todays_orders(sessions.now_et() - lookback)
 
+    def replacement_of(self, order_id: str, state: dict[str, Any], symbol: str, side: Side, *,
+                       earlier: Any) -> ReplacementLookup:
+        """Look for the order that REPLACED *order_id*, a protective order
+        a position's record tracks (its stop or its target) that the broker
+        lists REPLACED (*state*: its state row) (2026-11-11).
+
+        Schwab does not edit an order: a change in the app, or the bot's own
+        replace, ends it as REPLACED and creates a new one. That is the one
+        its payload names (``replaced_by``), else the one the listing's row
+        for it names, else the one found among the account's orders entered
+        from its own entry on (``entered_at``, less a minute:
+        ``broker_payloads.moved_child_replacement`` on the symbol for the
+        *side* position, leaving out *earlier*, the orders known not to be
+        it). Its replacement cannot have been entered before it, so that
+        read is the same for a strategy that is flat by the close and one
+        that holds for days, and for a restart on a later day.
+
+        None is found when its entry time does not read, when those orders
+        cannot be read (``unread``: a read to try again, where the others
+        are answers), or when they show none or more than one that fits:
+        the caller holds rather than guess. When they show that nothing
+        entered after it can still rest (``gone``,
+        ``broker_payloads.nothing_rests_after``) there is nothing to hold
+        for, and ``sold`` says what those orders filled. One rule for the
+        fill reconcile's follow (``PositionManager._follow_replaced_child``)
+        and the restart's booking of a stop that filled while the bot was
+        down (``StartupReconciler._book_positions_closed_while_down``)."""
+        if state.get("replaced_by") is not None:
+            return ReplacementLookup(str(state["replaced_by"]), "named by its payload")
+        entered = state.get("entered_at")
+        if not isinstance(entered, datetime.datetime) or entered.utcoffset() is None:
+            return ReplacementLookup(None, "the time it was entered does not read")
+        orders = self.todays_orders(entered - datetime.timedelta(minutes=1))
+        if orders is None:
+            return ReplacementLookup(None, "the orders could not be read", unread=True)
+        listed = next((order for order in orders if str(order.get("orderId")) == str(order_id)), None)
+        if listed is not None and listed.get("replacementId") is not None:
+            return ReplacementLookup(str(listed["replacementId"]), "named by its listing")
+        replaced = {"orderId": order_id, "orderType": state.get("order_type"), "enteredTime": entered.isoformat()}
+        found = moved_child_replacement(orders, replaced, symbol, side, earlier=earlier)
+        if found is not None:
+            return ReplacementLookup(str(found["orderId"]), "found among the orders listed")
+        gone, sold = nothing_rests_after(orders, replaced, symbol, side, earlier=earlier)
+        if gone:
+            return ReplacementLookup(None, "nothing entered after it can still rest", gone=True, sold=sold)
+        return ReplacementLookup(None, "none, or more than one, of the orders listed fits")
+
     def order_state(self, order_id: str) -> dict[str, Any] | None:
         """One order's state row (the ``fetch_order_states`` shape) via
         ``order_details``, for an order the account_orders listing did not
@@ -1543,6 +1610,10 @@ class SchwabExecutor:
         ids: dict[str, Any] = {key: known_bracket.get(key) for key in BRACKET_ID_KEYS}
         ids["child_order_ids"] = [str(oid) for oid in (known_bracket.get("child_order_ids") or []) if oid]
         ids.update(booked_fills_ledger(known_bracket))
+        # The orders it tracked before these go along too: a later look for
+        # a replacement leaves them out (BRACKET_REPLACED_IDS_KEY).
+        if known_bracket.get(BRACKET_REPLACED_IDS_KEY):
+            ids[BRACKET_REPLACED_IDS_KEY] = [str(oid) for oid in known_bracket[BRACKET_REPLACED_IDS_KEY]]
         return ids
 
     def _adoptable_protection(self, parent_order_id: str | None,
@@ -1648,7 +1719,12 @@ class SchwabExecutor:
             )
             return True, f"replaced:{status_code}:new_id_unknown"
         if new_order_id != child_order_id:
+            note_replaced_order(bracket, child_order_id)
             bracket[child_key] = new_order_id
+            if str(bracket.get("protective_order_id") or "") == child_order_id:
+                # A lone protective stop is its own wrapper: the cancel must
+                # go to the order that rests, not to the REPLACED one.
+                bracket["protective_order_id"] = new_order_id
             children = [str(oid) for oid in (bracket.get("child_order_ids") or [])]
             if child_order_id in children:
                 children[children.index(child_order_id)] = new_order_id
@@ -1749,6 +1825,30 @@ class SchwabExecutor:
                                 symbol, msg, resting_target)
         return adjustments
 
+    def _cancel_protective_order(self, order_id: str, fills: dict[str, tuple[int, float | None, str, bool]],
+                                 stop_reason: str, messages: list[str]) -> bool:
+        """Cancel one order of a bracket (``cancel_bracket``), and the order
+        that REPLACED it when it reads REPLACED, and that one's in turn.
+        True once nothing of it can still rest: each order of the chain is
+        down or filled. What each filled is added to *fills* by its own
+        order id, and each cancel's outcome to *messages*. False when a
+        cancel is not confirmed, or when a REPLACED order's payload names no
+        replacement (or one already cancelled here): that replacement may
+        still rest."""
+        cancelled: set[str] = set()
+        while True:
+            cancelled.add(order_id)
+            cancel_ok, msg, payload = self._cancel_live_equity_order(order_id)
+            messages.append(f"{order_id}:{msg}")
+            collect_protective_fills(payload, fills, stop_reason=stop_reason)
+            if not cancel_ok or order_status(payload) != REPLACED_STATUS:
+                return cancel_ok
+            replacement = order_replacement_id(payload)
+            if replacement is None or replacement in cancelled:
+                messages.append(f"{order_id}:replaced_replacement_unknown")
+                return False
+            order_id = replacement
+
     def cancel_bracket(self, bracket: dict[str, Any] | None) -> BracketCancel:
         """Cancel every resting protective order for a position.
 
@@ -1760,6 +1860,22 @@ class SchwabExecutor:
         original legs down in one call. A child REPLACED since entry is a new
         order the wrapper may not own, so every tracked child id is checked
         too and cancelled if it is still live.
+
+        An order that reads REPLACED is not down: it lives on in its
+        replacement (changed in the app, or by a replace of the bot's whose
+        answer carried no new id). The cancel goes on to the order its
+        payload names, and to that one's in turn
+        (``_cancel_protective_order``); one that names none leaves the
+        cancel unconfirmed (``replaced_replacement_unknown``), so the caller
+        defers, as it does on any cancel it cannot confirm, and the fill
+        reconcile's follow finds the replacement
+        (``PositionManager._follow_replaced_child``). That holds for a
+        wrapper too: an OCO replaced as a whole rests under ids the record
+        does not have. A lone protective stop is its own wrapper, and the
+        record's wrapper id moves with it when it is replaced
+        (``replace_bracket_child``, the follow). Until 2026-11-11 a
+        REPLACED child read as down, and the engine's exit went out beside
+        its replacement.
 
         The result carries what the children FILLED before the cancel landed.
         A stop that triggered after this cycle's fill reconcile has already
@@ -1781,22 +1897,17 @@ class SchwabExecutor:
         fills: dict[str, tuple[int, float | None, str, bool]] = {}
         stop_reason = protective_stop_reason(bracket)
         if wrapper_id:
-            cancel_ok, msg, payload = self._cancel_live_equity_order(wrapper_id)
-            ok = cancel_ok
-            messages.append(f"{wrapper_id}:{msg}")
-            collect_protective_fills(payload, fills, stop_reason=stop_reason)
+            ok = self._cancel_protective_order(wrapper_id, fills, stop_reason, messages)
         for child_id in child_ids:
             if wrapper_id:
                 # Usually already down with the wrapper: confirm before
-                # spending a cancel call on it.
+                # spending a cancel call on it. A REPLACED one is not down.
                 payload, _status = self._equity_order_details(child_id)
-                if payload is not None and (order_is_terminal_failure(payload) or order_is_filled(payload)):
+                if payload is not None and order_status(payload) != REPLACED_STATUS \
+                        and (order_is_terminal_failure(payload) or order_is_filled(payload)):
                     collect_protective_fills(payload, fills, stop_reason=stop_reason)
                     continue
-            cancel_ok, msg, payload = self._cancel_live_equity_order(child_id)
-            ok = ok and cancel_ok
-            messages.append(f"{child_id}:{msg}")
-            collect_protective_fills(payload, fills, stop_reason=stop_reason)
+            ok = self._cancel_protective_order(child_id, fills, stop_reason, messages) and ok
         # Fills already booked for a child the bracket no longer tracks (a
         # dead stop an unconfirmed retire dropped): its wrapper's payload
         # still carries it and reports them again (2026-09-25). The rest is

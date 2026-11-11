@@ -403,7 +403,7 @@ Behavior and valid values:
 - `reconcile_on_startup`: whether to inspect broker positions/orders at startup.
   - A reconcile that cannot read the broker fails closed (since 2026-09-25). A read that fails, including a JSON error body such as the 401 a lapsed token returns, is never read as empty. An unread account settles, cancels, restores and prunes nothing, and every ignore-list symbol stays blocked until its own recheck reads the account. An unread working-order list still lets the settle run, except that a position with a resting broker bracket that the broker holds fewer shares of, and that keeps some, is held until a retry reads the list (its re-protect needs the list to see a stop still resting for it); in bracket mode the restore waits for the list (restoring without it placed a second stop beside the one still resting), and without bracket mode the restore runs so the engine manages what the broker holds. A working exit or foreign order whose state cannot be read fails the attempt too (a dry run reads no order state, so there a saved position's unread exit simply does not match). In `block`, `restore_basic` and `restore_hybrid` a failed attempt blocks entries (`startup_reconcile_failed`; an unread foreign order keeps `working_orders_present`). The engine retries on trading days inside the 07:00-20:00 ET stream window, 60 seconds after the failed attempt ends, doubling to at most 5 minutes, and the first attempt that reads the broker clears the block. Until a reconcile has succeeded, a metadata save writes the tracked positions over their stored rows and deletes none, so a retry still restores the rest from them; the first success replaces them all. Before, one failed read blocked entries until the next ET day or a restart.
   - The settle (the session-boundary re-run, and every retry) books what the broker no longer holds (since 2026-09-25):
-    - A position with a resting broker bracket has it cancelled first. What its children filled, such as a stop that triggered after the last management cycle, is booked as the bracket's exit at the broker's price with the risk manager's registration, and only the rest of the gap is booked `closed_outside_bot` at the last mark, estimated. A cancel that cannot be confirmed leaves the position as it was, with nothing placed beside the bracket, and holds it: the manager sends nothing for it (no exit, no re-protect sized to shares that are gone), and the retry sends the cancel again. The first retry after a hold comes after 10 seconds whatever failed before it, doubling only while the hold lasts, and a hold is lifted only by an attempt that can read the position again. When the cancel reports fills, the account and then the working exit order are read again once the bracket is down, since a child, or the working exit, can fill between the first reads and the cancel. What is left is re-protected, adopting a stop still resting for it (one moved in the app) rather than stacking on it.
+    - A position with a resting broker bracket has it cancelled first. What its children filled, such as a stop that triggered after the last management cycle, is booked as the bracket's exit at the broker's price with the risk manager's registration, and only the rest of the gap is booked `closed_outside_bot` at the last mark, estimated. A cancel that cannot be confirmed leaves the position as it was, with nothing placed beside the bracket, and holds it: the manager sends nothing for it (no exit, no re-protect sized to shares that are gone), and the retry sends the cancel again. The first retry after a hold comes after 10 seconds whatever failed before it, doubling only while the hold lasts, and a hold is lifted only by an attempt that can read the position again. When the cancel reports fills, the account and then the working exit order are read again once the bracket is down, since a child, or the working exit, can fill between the first reads and the cancel. What is left is re-protected, adopting a stop still resting for it (one placed in the app) rather than stacking on it. A tracked position's stop the broker lists `REPLACED` is followed to its replacement before the settle runs (2026-11-11), so the cancel goes to the order that rests, and the replacement is the position's own, not a foreign order that blocks the day.
     - The estimated loss of a close outside the bot counts toward `max_daily_loss`; an estimated gain does not, since the mark can be stale.
     - A position whose entry order is still settling is left to the entry gatekeeper: the reconcile books unsettled entry orders from their own fill records first, restores nothing and settles nothing against an order still settling, and fails the attempt until it has.
     - The session-boundary reconcile runs before the cycle, so the first premarket cycle no longer manages positions closed overnight.
@@ -413,7 +413,9 @@ Behavior and valid values:
     - No fill time that reads (none in the payload, one after today, one before the entry), for a position entered before today: booked at the restart's time, named at ERROR, and counted in the tally only when it is a loss; the trade's exit time and hold are then the restart's, not the fill's. A position entered today filled today whatever the payload says of the time, and is booked as today's.
     - A saved disaster stop record still `unconfirmed` (its submit's outcome was unknown and the process ended before the lookup) is looked up among the orders entered from a minute before its submit: the exit `STOP` at exactly the price and quantity sent. Until 2026-11-10 such a row read "no stop order saved" and was not booked, on any day.
     - What the running bot had already booked of the stop before it stopped (the record's booked fills) is left out and the rest priced as its own fills, as the running bot nets them (2026-11-10): until then the saved quantity was booked at the order's whole average, and a stop whose every fill was booked could be booked again as the close.
-    - Not booked, each named at ERROR: a row with no saved stop, a stop that did not fill (closed in the app), a fill with no price, a stop moved in the app (REPLACED: its replacement is not followed), and the shares of the position a partial fill does not cover. A stop, or the order list an unconfirmed record needs, that cannot be read keeps the row and fails the attempt, so the retry reads it. A booked row whose delete fails is remembered for the life of the process, so no retry books it again. A stop that filled over more than one day is booked whole on the day of its last execution, at the order's average. Options and a dry run are not judged.
+    - A saved stop the broker lists `REPLACED` (moved in the app, or replaced by the bot with no new id returned) is followed to the order that replaced it, and that one's in turn, as the running bot follows it (2026-11-11): each order books its own unbooked fills as a slice, at its own price and on its own fill's day. An order of the chain that cannot be read keeps the row and fails the attempt; a replacement that is not found is named at ERROR, and what was read is booked.
+    - A saved stop that may still rest is cancelled first, with what else its record tracks (2026-11-11): the position closed some other way (sold in the app), and the bot's own stop must not outlive it. What it sold by the time it is down is booked. A cancel that is not confirmed keeps the row and fails the attempt. Until then the row was pruned and the stop left working: a foreign order that blocked entries, or, past the order lookback, a sell stop against a flat account. A record a dry run saved is never cancelled.
+    - Not booked, each named at ERROR: a row with no saved stop, a stop that did not fill (closed in the app), a fill with no price, and the shares of the position no fill covers. A stop, or the order list an unconfirmed record needs, that cannot be read keeps the row and fails the attempt, so the retry reads it. A booked row whose delete fails is remembered for the life of the process, so no retry books it again. A stop that filled over more than one day is booked whole on the day of its last execution, at the order's average. Options and a dry run are not judged.
   - A broker row whose `longQuantity` or `shortQuantity` is not a finite number (NaN, ±inf, unparseable; an absent or empty one is 0) says nothing about what is held (since 2026-09-26). The settle leaves a tracked position with such a row as it is, still managed, and fails the attempt: the attempt is retried in every mode and, as any failed attempt, blocks entries in the blocking modes (in `block` the held row already blocks them, `broker_positions_present`). An ignore-list symbol with such a row stays blocked, as when the account read fails. A restore leaves such a row, and one whose `averagePrice` is not a positive finite number (absent, zero, NaN, ±inf), restores every other row, so those positions are tracked and managed (stops included), and then fails the attempt naming each row it left, which blocks entries (`startup_reconcile_failed`). The retry restores each left row once it reads, and nothing twice (a tracked symbol is skipped), and `restore_hybrid` prunes no saved metadata until an attempt reads every row, so a left row still restores from its saved levels. Before, the settle read the quantity as 0 and booked the position `closed_outside_bot`, and a restore took an absent, zero or NaN average price as an entry of 0.01, whose `restore_basic` levels the live price was already past: the first management cycle exited a LONG at its target and a SHORT at its stop.
   - In a dry run, broker protection is simulated: a restore never adopts or resizes a real resting order, and the engine owns the stop and target exits. The simulated bracket keeps the real order's ids, so that order is not counted as foreign. A saved row that tracks a working exit order restores basic in a dry run, which can never settle that order.
   - Bracket mode: a stop that died at the broker without filling (a DAY order that EXPIRED at its session's end, one CANCELED in the app, a REJECTED one) retires its bracket: the rest of it is cancelled, what that cancel reports filled is booked, and the position is re-protected once per bracket, or the engine owns the stop. A REJECTED stop is never placed again (the broker would reject it again), and a cancel that cannot be confirmed leaves the rest of the bracket tracked while the engine owns the stop; once the rest is confirmed down, the dead stop gets its one fresh placement. A child the 8-hour order listing no longer returns is read on its own, at most once a minute while it is live, so a stop placed before 07:00 that fills after 15:00 is booked. A working exit order that closes a position takes its leftover bracket down.
@@ -533,7 +535,7 @@ Behavior and valid values:
 - `disaster_stop_enabled`: rest a static disaster stop at the broker for each equity position. See below. On unless a config says `false`: on in every equity preset, off in the two option presets (an options config must say `false`, or it is refused).
 - `disaster_stop_r`: how far beyond the initial stop the disaster stop rests, in units of the trade's initial R. A finite number above 0.
 - `disaster_stop_min_pct`: the least that distance can be, as a fraction of the entry price (0 turns the floor off). A finite number in [0, 1].
-- `disaster_stop_escalation_attempts`: every this-many consecutive attempts that leave a position without its disaster stop log a CRITICAL naming it (`DISASTER STOP DEGRADED`), every this-many consecutive failed reads of a closed position's post-close sweep too (`EXIT ORDERS LEFT`), and every this-many consecutive passes a position is held because an exit order changed in the app has a replacement the day's orders do not show (`ORDER REPLACED UNTRACKED`). An integer >= 1.
+- `disaster_stop_escalation_attempts`: every this-many consecutive attempts that leave a position without its disaster stop log a CRITICAL naming it (`DISASTER STOP DEGRADED`), every this-many consecutive failed reads of a closed position's post-close sweep too (`EXIT ORDERS LEFT`), and every this-many consecutive passes a position is held because an order changed in the app (a working exit, or its resting stop or target) has a replacement the orders do not show (`ORDER REPLACED UNTRACKED`). An integer >= 1.
 
 #### Broker-side bracket orders
 
@@ -754,11 +756,10 @@ off from the broker.
   a filled disaster stop as a `disaster_stop` exit; every engine exit (stop,
   giveback, time stop, CHoCH, force flatten, a scale-out) cancels it first and
   books what it sold before the cancel landed (a cancel that cannot be
-  confirmed defers the exit a cycle, as for a bracket), except a tracked one
-  the user moved in the app: Schwab replaces it under a new id, the cancel
-  reads the replaced original as down, and the exit goes out beside the
-  replacement, so a flush can fill both (queued before any live flip; after a
-  full close the sweep cancels the replacement); an `unconfirmed` one is
+  confirmed defers the exit a cycle, as for a bracket); a tracked one the
+  broker lists `REPLACED` (moved in the app, or resized with no new id
+  returned) is followed to its replacement at the head of every pass, see
+  "A stop moved in the app" below; an `unconfirmed` one is
   looked up first, at once: its fills are booked, and one that may still rest
   (a moved one's replacement too) is adopted so the cancel takes it down (the
   orders unreadable, or a moved one's replacement not found: the exit waits a
@@ -778,6 +779,42 @@ off from the broker.
   once late entry fills grew the position) is a miss, resized again, then
   cancelled and placed at the held size. Unlike a bracket's stop, it never
   stands the engine's stop down.
+- **A stop moved in the app (2026-11-11).** Schwab does not edit an order: a
+  move ends the old one as `REPLACED` and creates a new one, and so does the
+  bot's own resize. When the record's stop (or a bracket's target) reads
+  `REPLACED`, the fill reconcile follows it before anything else: what the old
+  order sold itself is booked, once; the replacement is the one its payload
+  names, else the one later order of its kind on the symbol for the side,
+  looked for among the orders entered since the stop itself was (two moves
+  between two looks are followed link by link; one moved and then cancelled
+  is followed to the cancelled order, and a fresh stop is placed; a trailing
+  stop is a stop's kind; one changed into a limit order is the one exit order
+  of another kind entered after it that may still rest); the record is
+  re-pointed and saved. The price it was moved to is kept. A quantity larger
+  than the shares held is cut to them at once; a smaller one is left as it
+  was sized (the bot's own count is too high once shares were sold by hand,
+  so it enlarges no order it did not size). From then on the replacement is
+  the position's stop: its fill is booked, an exit cancels it first. While
+  the replacement cannot be found (two orders that may be it, a cancelled one
+  beside it that sold shares, orders that cannot be read) the position is
+  held: no exit goes out beside it, the close's force flatten included, and
+  nothing is placed; every such pass logs at ERROR and every
+  `disaster_stop_escalation_attempts`-th `ORDER REPLACED UNTRACKED` at
+  CRITICAL, naming the symbol. The hold ends when the orders show one
+  replacement: cancel any other exit order on the symbol at the broker. When
+  every exit order entered after it has filled or died, nothing rests and
+  there is nothing to hold for, once the orders have said so for a minute (a
+  listing can run behind; the position is held meanwhile): with nothing sold
+  a fresh stop is placed;
+  with shares sold (the stop turned into a limit order that filled, a sale
+  made by hand) nothing is booked from those orders, the position is held for
+  the broker reconcile, which runs on the next pass, compares it with the
+  account and books what left it. The broker reconcile runs the same follow
+  first, and a
+  restart follows the saved stop the same way. Until this the record kept the
+  old id:
+  the exit's cancel read it as down and the exit went out beside the
+  replacement, and a fill of the replacement was never booked.
 - **After a full close.** Once a position that had live broker protection is
   closed in full, the day's orders are read, and any exit order that may still
   work on the symbol for its side (any status but a terminal one) is cancelled:

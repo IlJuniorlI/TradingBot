@@ -55,6 +55,11 @@ ORDER_REPLACED = "replaced"
 ORDER_LIVE = "live"
 # The ``orderType`` of a protective stop.
 STOP_ORDER_TYPES = frozenset({"STOP", "STOP_LIMIT"})
+# The ``orderType`` a tracked protective stop changed in the app may come back
+# as and still be a stop (``moved_child_replacement``): the stops the bot
+# sends, and the trailing ones. Only the look for a moved stop's replacement
+# reads it; the bot places, adopts and prices none of the trailing kinds.
+MOVED_STOP_ORDER_TYPES = STOP_ORDER_TYPES | {"TRAILING_STOP", "TRAILING_STOP_LIMIT"}
 
 # The order-id keys of a bracket record (``Position.metadata["bracket"]``).
 # A wrapper's cancel takes the original legs down with it: the OCO of a
@@ -65,6 +70,19 @@ STOP_ORDER_TYPES = frozenset({"STOP", "STOP_LIMIT"})
 BRACKET_WRAPPER_KEYS = ("oco_order_id", "protective_order_id")
 BRACKET_CHILD_KEYS = ("stop_order_id", "target_order_id")
 BRACKET_ID_KEYS = BRACKET_WRAPPER_KEYS + BRACKET_CHILD_KEYS
+# The record's list of the child orders it tracked before the ones it tracks
+# now: each REPLACED at the broker and left for its replacement (by the bot's
+# own replace, or by the follow of a change made in the app). Never working
+# orders, so not among the id keys. The look for a REPLACED child's unnamed
+# replacement leaves them out (``moved_child_replacement``): one entered in
+# the same second as the order that replaced it (or whose entry time does not
+# read) counts as entered no earlier, and was taken for that order's own
+# replacement. Only the newest ``BRACKET_REPLACED_IDS_KEPT`` are kept
+# (``note_replaced_order``): a stop a trail sync replaces all day would grow
+# the saved record without bound, and it is the orders just before the one
+# tracked now that can be taken for a later one.
+BRACKET_REPLACED_IDS_KEY = "replaced_order_ids"
+BRACKET_REPLACED_IDS_KEPT = 20
 
 # The ``sync_mode`` of a disaster stop's record (``execution.
 # disaster_stop_enabled``, 2026-09-28): a lone STOP beyond the engine's
@@ -473,6 +491,10 @@ def flatten_order_tree(node: Any, out: dict[str, dict[str, Any]]) -> None:
             "is_terminal_failure": order_is_terminal_failure(node),
             # The order that REPLACED it, when the payload names one.
             "replaced_by": order_replacement_id(node),
+            # When the broker entered it; None when that does not read. What
+            # a later order is told by when this one reads REPLACED and names
+            # no replacement (SchwabExecutor.replacement_of).
+            "entered_at": order_entered_at(node),
             # Shares still resting: what adoption compares against the
             # position before it trusts a working child.
             "remaining_qty": order_remaining_qty(node),
@@ -600,6 +622,15 @@ def add_booked_child_fill(record: dict[str, Any], order_id: Any, slice_qty: int,
         record, order_id, qty + int(slice_qty),
         None if notional is None or slice_price is None else notional + float(slice_price) * int(slice_qty),
         estimated or slice_estimated)
+
+
+def note_replaced_order(bracket: dict[str, Any], order_id: Any) -> None:
+    """Record on *bracket* that it no longer tracks child *order_id*,
+    REPLACED at the broker and left for its replacement
+    (``BRACKET_REPLACED_IDS_KEY``), keeping the newest
+    ``BRACKET_REPLACED_IDS_KEPT``."""
+    left = [str(oid) for oid in bracket.get(BRACKET_REPLACED_IDS_KEY) or [] if str(oid) != str(order_id)]
+    bracket[BRACKET_REPLACED_IDS_KEY] = [*left, str(order_id)][-BRACKET_REPLACED_IDS_KEPT:]
 
 
 def is_disaster_stop(bracket: Any) -> bool:
@@ -789,19 +820,199 @@ def replacement_order(orders: list[dict[str, Any]], replaced: dict[str, Any], sy
     named = replaced.get("replacementId")
     if named is not None:
         return next((order for order in orders if str(order.get("orderId")) == str(named)), None)
+    candidates = [order for order in _later_orders_of_its_kind(orders, replaced, symbol, side, entry=entry) or []
+                  if order_status_class(order.get("status")) != ORDER_DEAD]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _later_orders_of_its_kind(orders: list[dict[str, Any]], replaced: dict[str, Any], symbol: Any, side: Side, *,
+                              entry: bool = False, earlier: Any = (),
+                              stop_types: frozenset[str] = STOP_ORDER_TYPES) -> list[dict[str, Any]] | None:
+    """The ``extract_orders`` rows among *orders* that could have REPLACED
+    *replaced* (a row that names no replacement), whatever their status:
+    the exit orders on *symbol* for a *side* position (with *entry*, the
+    entry orders for it) of its kind (a stop, one of *stop_types*, for a
+    stop; any other type for any other), entered no earlier than it, other
+    than itself and the orders known not to be it (*earlier*: their ids).
+    One whose entry time cannot be read counts. None when the time
+    *replaced* was entered cannot be read: nothing can be told to be
+    later."""
     entered = order_entered_at(replaced)
     if entered is None:
         return None
-    is_stop = replaced.get("orderType") in STOP_ORDER_TYPES
+    is_stop = replaced.get("orderType") in stop_types
     rows = entry_orders(orders, symbol, side) if entry else exit_orders(orders, symbol, side)
-    candidates = [
+    before = {str(replaced.get("orderId")), *(str(oid) for oid in earlier)}
+    return [
         order for order in rows
-        if str(order["orderId"]) != str(replaced.get("orderId"))
-        and (order.get("orderType") in STOP_ORDER_TYPES) is is_stop
-        and order_status_class(order.get("status")) != ORDER_DEAD
+        if str(order["orderId"]) not in before
+        and (order.get("orderType") in stop_types) is is_stop
         and (order_entered_at(order) is None or order_entered_at(order) >= entered)
     ]
-    return candidates[0] if len(candidates) == 1 else None
+
+
+def moved_child_replacement(orders: list[dict[str, Any]], replaced: dict[str, Any], symbol: Any,
+                            side: Side, *, earlier: Any) -> dict[str, Any] | None:
+    """The ``extract_orders`` row among *orders* of the order that REPLACED
+    *replaced*, a protective order a position's record tracks (its stop or
+    its target) that names no replacement, or None (2026-11-11). *earlier*
+    are the ids of the orders known not to be it: the ones the record
+    tracked before (``BRACKET_REPLACED_IDS_KEY``) and the position's other
+    orders.
+
+    Such an order rests for as long as the position is held, a
+    good-till-cancelled disaster stop for days, and it can be changed more
+    than once between two looks (two edits after the close), changed and
+    then cancelled, or changed into another kind of order. So this goes
+    further than ``replacement_order``, which the followers of a working
+    entry or exit order keep. Among the exit orders of its kind on *symbol*
+    for the *side* position entered no earlier than it
+    (``_later_orders_of_its_kind``; a stop's kind takes in the trailing
+    stops, ``MOVED_STOP_ORDER_TYPES``):
+
+    - exactly one that is not dead: that one, as ``replacement_order``;
+    - several that are not dead, exactly one of them not itself REPLACED:
+      a chain of changes. The earliest-entered is taken (when every one's
+      entry time reads and no other shares it), and the caller follows the
+      next link from it;
+    - none that is not dead, and dead ones: nothing of it rests any more.
+      The dead one; of several, the one that filled shares when exactly one
+      did. When none did, any of them serves, since nothing rests and
+      nothing is to be booked: the newest, or the last listed when their
+      entry times do not tell. The caller retires it like any dead
+      protective order, booking what it filled. Without this a stop moved
+      and then cancelled in the app was never told from one whose
+      replacement is not listed yet;
+    - none of its kind at all: it was changed into another kind of order (a
+      stop into a limit order). The one exit order of another kind entered
+      after it that may still rest (``_changed_kind_replacement``).
+
+    None for anything else: two that may still rest or have filled, dead
+    ones of which two filled, a chain one of whose entry times cannot be
+    read, or none listed. So too when one that is not dead would be
+    taken while a dead one beside it filled shares: those shares were sold
+    by an order the pick does not lead to, and the record would never book
+    them. The caller holds rather than guess, unless nothing listed can
+    still rest (``nothing_rests_after``)."""
+    later = _later_orders_of_its_kind(orders, replaced, symbol, side, earlier=earlier,
+                                      stop_types=MOVED_STOP_ORDER_TYPES)
+    if later is None:
+        return None
+    if not later:
+        return _changed_kind_replacement(orders, replaced, symbol, side, earlier)
+    alive = [order for order in later if order_status_class(order.get("status")) != ORDER_DEAD]
+    dead_filled = [order for order in later if order_status_class(order.get("status")) == ORDER_DEAD
+                   and order_row_filled_qty(order) > 0]
+    if alive:
+        if dead_filled:
+            return None
+        if len(alive) == 1:
+            return alive[0]
+        ends = [order for order in alive if order_status_class(order.get("status")) != ORDER_REPLACED]
+        return _earliest_entered(alive) if len(ends) == 1 else None
+    if len(later) == 1:
+        return later[0]
+    if dead_filled:
+        return dead_filled[0] if len(dead_filled) == 1 else None
+    return _earliest_entered(later, newest=True) or later[-1]
+
+
+def _changed_kind_replacement(orders: list[dict[str, Any]], replaced: dict[str, Any], symbol: Any, side: Side,
+                              earlier: Any) -> dict[str, Any] | None:
+    """The replacement of a tracked protective order no later order of its
+    kind is listed for (``moved_child_replacement``): the one exit order of
+    another kind on *symbol* for the *side* position, entered after it,
+    that may still rest (``order_may_be_live``), other than the orders
+    known not to be it (*earlier*). None when that is not exactly one, or
+    when its entry time cannot be read.
+
+    One that may still rest, never one that filled or died: an order
+    working on the symbol that no record tracks is the changed order, or
+    one placed by hand, and tracking it lets an exit cancel it first and
+    its fill be booked. One that already filled cannot be told from a sale
+    made by hand, whose shares the reconcile's settle books, and taking it
+    booked them a second time (the second review's probe); what filled or
+    died is left to ``nothing_rests_after``.
+
+    Entered after it, not with it: an exit order of the bot's own is sent
+    before the stop that follows it and can share its second, and a change
+    made by hand cannot. Without this a stop changed in the app into a
+    limit order was never found, and the position was held with no exit
+    for as long as that order worked."""
+    entered = order_entered_at(replaced)
+    is_stop = replaced.get("orderType") in MOVED_STOP_ORDER_TYPES
+    before = {str(replaced.get("orderId")), *(str(oid) for oid in earlier)}
+    others = [
+        order for order in exit_orders(orders, symbol, side)
+        if str(order["orderId"]) not in before
+        and (order.get("orderType") in MOVED_STOP_ORDER_TYPES) is not is_stop
+        and order_may_be_live(order.get("status"))
+        and (order_entered_at(order) is None or order_entered_at(order) > entered)
+    ]
+    return others[0] if len(others) == 1 and order_entered_at(others[0]) is not None else None
+
+
+def nothing_rests_after(orders: list[dict[str, Any]], replaced: dict[str, Any], symbol: Any, side: Side, *,
+                        earlier: Any) -> tuple[bool, int]:
+    """Whether nothing listed can still rest in place of *replaced*, a
+    tracked protective order whose replacement ``moved_child_replacement``
+    could not tell, and the shares the orders listed after it sold:
+    ``(gone, sold)`` (2026-11-11).
+
+    Gone when *orders* list at least one exit order on *symbol* for the
+    *side* position entered after it (the orders known not to be it,
+    *earlier*, left out) and every one of them filled or died: whichever
+    replaced it, none can rest or fill any more. An order of its own kind
+    entered in its second counts as after it; one of another kind only
+    when entered after that second, as in ``_changed_kind_replacement``: an
+    exit order of the bot's own is sent before the stop that follows it
+    and can share its second, and counted, such an order made "gone" true
+    while the replacement was only not listed yet, so a second stop went
+    in beside it (the third review's probe). Not gone while one may still
+    rest or reads REPLACED (its own replacement may rest), nor when none
+    is listed after it (the replacement is not listed yet), nor when the
+    time *replaced* was entered cannot be read. An order whose own entry
+    time cannot be read is no evidence that anything came after, but it
+    keeps "gone" false while it may rest, and what it filled is counted.
+
+    *sold* is what those orders filled between them. Which of them was the
+    replacement is not known, so none of it is booked from here: the caller
+    retires the record when nothing was sold, and otherwise leaves the
+    position to the broker reconcile's settle, which compares it with the
+    account. Without this a position whose stop was changed into another
+    kind of order and then cancelled, or whose replacement could not be
+    told from another order that had since filled, was held with no exit
+    and no stop until a restart."""
+    entered = order_entered_at(replaced)
+    if entered is None:
+        return False, 0
+    is_stop = replaced.get("orderType") in MOVED_STOP_ORDER_TYPES
+    before = {str(replaced.get("orderId")), *(str(oid) for oid in earlier)}
+    later: list[dict[str, Any]] = []
+    undated: list[dict[str, Any]] = []
+    for order in exit_orders(orders, symbol, side):
+        if str(order["orderId"]) in before:
+            continue
+        at = order_entered_at(order)
+        if at is None:
+            undated.append(order)
+        elif at > entered or (at == entered and (order.get("orderType") in MOVED_STOP_ORDER_TYPES) is is_stop):
+            later.append(order)
+    if not later or any(order_status_class(order.get("status")) in (ORDER_LIVE, ORDER_REPLACED)
+                        for order in (*later, *undated)):
+        return False, 0
+    return True, sum(order_row_filled_qty(order) for order in (*later, *undated))
+
+
+def _earliest_entered(orders: list[dict[str, Any]], *, newest: bool = False) -> dict[str, Any] | None:
+    """The row among *orders* entered before every other (with *newest*,
+    after every other), or None when an entry time does not read or
+    another row shares that time."""
+    times = [order_entered_at(order) for order in orders]
+    if any(stamp is None for stamp in times):
+        return None
+    wanted = max(times) if newest else min(times)
+    return orders[times.index(wanted)] if times.count(wanted) == 1 else None
 
 
 def order_replacement_id(payload: dict[str, Any] | None) -> str | None:

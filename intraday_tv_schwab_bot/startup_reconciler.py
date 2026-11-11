@@ -57,6 +57,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
 
 from .broker_payloads import (
+    BRACKET_REPLACED_IDS_KEY,
     DISASTER_SYNC_MODE,
     ORDER_REPLACED,
     active_broker_bracket,
@@ -69,6 +70,8 @@ from .broker_payloads import (
     is_disaster_stop,
     listed_stop,
     note_booked_child_fills,
+    order_entered_at,
+    order_may_be_live,
     order_row_filled_qty,
     order_status_class,
     resting_exit_stop,
@@ -130,6 +133,7 @@ class StartupReconciler:
         reconcile_metadata_store: ReconcileMetadataStore,
         save_reconcile_metadata: Callable[[], None],
         book_bracket_cancel_fills: Callable[..., None],
+        follow_replaced_children: Callable[[], None],
         settle_unsettled_entry_orders: Callable[..., None],
         unsettled_entry_order_ids: Callable[[], dict[str, str]],
     ) -> None:
@@ -143,6 +147,10 @@ class StartupReconciler:
         self.reconcile_metadata_store = reconcile_metadata_store
         self._save_reconcile_metadata = save_reconcile_metadata
         self._book_bracket_cancel_fills = book_bracket_cancel_fills
+        # ``PositionManager.follow_replaced_children``: each tracked
+        # position's REPLACED protective orders followed to their
+        # replacements, ahead of the settle and the foreign-order check.
+        self._follow_replaced_children = follow_replaced_children
         self._settle_unsettled_entry_orders = settle_unsettled_entry_orders
         self._unsettled_entry_order_ids = unsettled_entry_order_ids
         # The error of the attempt's read of the reconcile metadata store,
@@ -694,11 +702,30 @@ class StartupReconciler:
         good-till-cancelled stop (a strategy that holds across sessions)
         could never have been booked at all.
 
+        A saved stop the broker lists REPLACED (moved in the app, or by a
+        replace of the bot's that returned no new id) is followed to the
+        order that replaced it, and that one's in turn
+        (``_saved_stop_links``, 2026-11-11): each order's unbooked fills are
+        booked as their own slice, at their own price and on their own
+        fill's day. Until then the saved id was read alone, a REPLACED stop
+        read as one that filled nothing, and the replacement's fill, the
+        close itself, was never booked. A replacement that cannot be found
+        is named at ERROR: what was read is booked, the rest is not.
+
+        A saved stop that may still rest is cancelled, with what else its
+        record tracks, before anything is booked
+        (``_cancel_orphan_stop``, 2026-11-11): the position closed some
+        other way, and the bot's own stop must not outlive it. What it
+        filled by the time it is down is booked like any other fill. Not
+        the stop of a record a dry run saved (``simulated``): its ids are
+        those of the real protection it stood for, which is the user's.
+
         A row whose stop is not saved or not found, cannot be read, or did
         not fill (closed in the app, or the save raced the exit) is logged
         at ERROR with what is known: its P&L is unknown and not in the
         tally, and the row is pruned as before (kept, and the attempt
-        failed, while the stop cannot be read).
+        failed, while a stop cannot be read or its cancel is not
+        confirmed).
 
         Not judged: a dry run (paper positions never reach the broker), a
         key still tracked (the settle's), a symbol the broker still holds
@@ -739,77 +766,202 @@ class StartupReconciler:
                 named = f"stop {stop_id}"
                 state = self.executor.order_state(str(stop_id))
                 unread = state is None
+                if state is not None:
+                    state = {**state, "order_id": str(stop_id)}
             elif is_disaster_stop(bracket) and bracket.get("state") == "unconfirmed":
                 named = "the stop its unconfirmed record sent"
                 state, unread, absent = self._unconfirmed_stop_fill(key, position, bracket)
             else:
                 named, state = "", None
-            filled = int((state or {}).get("filled_qty") or 0)
-            # Less what the running bot booked of this order before it
-            # stopped (the record's ledger, ``booked_child_part``), priced as
-            # the rest's own fills, as the manager's fill reconcile nets
-            # them: the saved quantity is already net of those shares, and
-            # the order's average covers both parts.
-            order_id = stop_id or (state or {}).get("order_id")
-            booked_qty, booked_notional, booked_estimated = (
-                booked_child_part(bracket, order_id) if order_id else (0, 0.0, False))
-            unbooked = filled - booked_qty
-            price, estimated = unbooked_fill_price(
-                filled, safe_float((state or {}).get("fill_price"), None, finite=True),
-                (state or {}).get("fill_price_estimated") is not False, booked_qty, booked_notional,
-                booked_estimated, what=f"{named} for {key}") if unbooked > 0 else (None, True)
+            # The saved stop and, when the broker lists it REPLACED (moved in
+            # the app), the orders its shares lived on in, in turn; *lost*
+            # says where that could not be followed.
+            links: list[dict[str, Any]] = []
+            lost = ""
+            if state is not None:
+                links, chain_unread, lost = self._saved_stop_links(position, bracket, state)
+                unread = unread or chain_unread
+            # The last of them may still rest (one the follow stopped at
+            # reads REPLACED, never that): the bot's own stop, against a
+            # position the account no longer holds. A dry run's record
+            # (``simulated``) keeps the ids of the real protection it stood
+            # for, the user's own: never cancelled here.
+            if links and not bracket.get("simulated") and order_may_be_live(links[-1].get("status")) \
+                    and not self._cancel_orphan_stop(key, position, bracket, links):
+                continue
+            # Each order's fills, less what the running bot booked of that
+            # order before it stopped (the record's ledger,
+            # ``booked_child_part``), priced as the rest's own fills, as the
+            # manager's fill reconcile nets them: the saved quantity is
+            # already net of those shares, and the order's average covers
+            # both parts.
+            slices: list[tuple[str, dict[str, Any], int, float, bool]] = []
+            read: list[str] = []
+            for link in links:
+                link_name = named if link is links[0] else f"stop {link['order_id']}"
+                filled = int(link.get("filled_qty") or 0)
+                booked_qty, booked_notional, booked_estimated = booked_child_part(bracket, link["order_id"])
+                read.append(f"{link_name} reads {link.get('status')} with {filled} filled"
+                            + (f", {booked_qty} of them booked before the restart" if booked_qty else ""))
+                if filled - booked_qty <= 0:
+                    continue
+                price, estimated = unbooked_fill_price(
+                    filled, safe_float(link.get("fill_price"), None, finite=True),
+                    link.get("fill_price_estimated") is not False, booked_qty, booked_notional, booked_estimated,
+                    what=f"{link_name} for {key}")
+                if price is not None and price > 0:
+                    slices.append((link_name, link, filled - booked_qty, float(price), estimated))
             if unread:
-                # The stop could not be read: the row stays for the retry,
-                # and the attempt fails at its end so one runs.
-                self._close_booking_error = f"{key}: {named} could not be read"
-            if state is None or unbooked <= 0 or price is None or price <= 0:
+                # A stop could not be read: the row stays for the retry, and
+                # the attempt fails at its end so one runs. Nothing of it is
+                # booked meanwhile: the retry books every order's fills.
+                self._close_booking_error = f"{key}: {lost or f'{named} could not be read'}"
+            if unread or not slices:
                 LOG.error("%s: %s %d at %.4f saved by the last run is not held by the broker; its close while the bot "
                           "was down is not booked (%s). The day's loss tally does not count it: check the account",
                           key, position.side.value, int(position.qty), float(position.entry_price),
                           "no stop order saved" if not named
-                          else f"{named} could not be read" if unread
+                          else (lost or f"{named} could not be read") if unread
                           else f"{named} {absent}" if state is None
-                          else f"{named} reads {state.get('status')} with {filled} filled"
-                          + (f", {booked_qty} of them booked before the restart" if booked_qty else ""))
+                          else "; ".join(read + ([lost] if lost else [])))
                 continue
-            filled_at = self._fill_time_while_down(state, position, now)
-            earlier_day = filled_at is not None and filled_at.date() < now.date()
-            # No fill time that reads leaves the day unknown only for a
-            # position entered before today: one entered today filled today.
-            day_unknown = filled_at is None and position.entry_time.astimezone(now.tzinfo).date() < now.date()
-            qty = min(int(position.qty), unbooked)
-            closed = copy.copy(position)
-            closed.qty = qty
-            self.account.record_restored_entry(closed, float(position.entry_price))
-            realized = self.account.record_exit(
-                closed, float(price), protective_stop_reason(bracket), final_exit=True, remaining_qty_after_exit=0,
-                fill_price_estimated=estimated, broker_recovered=True,
-                exit_time=filled_at if earlier_day else None,
-            )
-            self._closes_booked.add(key)
+            left = int(position.qty)
+            for link_name, link, unbooked, price, estimated in slices:
+                if left <= 0:
+                    break
+                qty = min(left, unbooked)
+                self._book_close_while_down(key, position, bracket, link_name, link, qty, price, estimated, now)
+                left -= qty
             self._carried_unmatched_reported.discard(symbol)
-            what = f"its {named.removeprefix('the ')} filled {qty} of {int(position.qty)} at {float(price):.4f}"
-            if day_unknown:
-                if float(realized) < 0:
-                    self.risk.register_realized_pnl(float(realized))
-                LOG.error("%s: closed while the bot was down: %s (realized %.2f), and the broker gives no fill time "
-                          "that reads (%r): booked at the restart's time, on a day it may not belong to, and %s",
-                          key, what, float(realized), state.get("filled_at"),
-                          "counted in the day's loss tally" if float(realized) < 0
-                          else "not counted in the day's loss tally (a gain of an unknown day)")
-            elif earlier_day:
-                LOG.warning("%s: closed while the bot was down: %s on %s (realized %.2f); booked at its fill time "
-                            "%s, in no figure of today's and not in today's loss tally", key, what, filled_at.date(),
-                            float(realized), filled_at.isoformat())
-            else:
-                self.risk.register_realized_pnl(float(realized))
-                LOG.warning("%s: closed while the bot was down: %s (realized %.2f); booked and counted in the day's "
-                            "loss tally", key, what, float(realized))
-            if qty < int(position.qty):
+            if left > 0:
                 LOG.error("%s: %d of its %d shares are not in the stop's fill and the broker holds none; how they "
-                          "closed is unknown and not booked: check the account", key, int(position.qty) - qty,
-                          int(position.qty))
+                          "closed is unknown and not booked: check the account", key, left, int(position.qty))
+            if lost:
+                LOG.error("%s: %s; what the replacement sold is not booked, and it may still rest: check the "
+                          "account", key, lost)
             self._delete_reconcile_metadata_row(key)
+
+    def _book_close_while_down(self, key: str, position: Position, bracket: dict[str, Any], named: str,
+                               state: dict[str, Any], qty: int, price: float, estimated: bool,
+                               now: datetime) -> None:
+        """Book *qty* shares of the saved *position* as closed by the stop
+        of *state* (*named* in the log) at *price* while the bot was down,
+        on the day its fill belongs to
+        (``_book_positions_closed_while_down``)."""
+        filled_at = self._fill_time_while_down(state, position, now)
+        earlier_day = filled_at is not None and filled_at.date() < now.date()
+        # No fill time that reads leaves the day unknown only for a
+        # position entered before today: one entered today filled today.
+        day_unknown = filled_at is None and position.entry_time.astimezone(now.tzinfo).date() < now.date()
+        closed = copy.copy(position)
+        closed.qty = qty
+        self.account.record_restored_entry(closed, float(position.entry_price))
+        realized = self.account.record_exit(
+            closed, float(price), protective_stop_reason(bracket), final_exit=True, remaining_qty_after_exit=0,
+            fill_price_estimated=estimated, broker_recovered=True,
+            exit_time=filled_at if earlier_day else None,
+        )
+        self._closes_booked.add(key)
+        what = f"its {named.removeprefix('the ')} filled {qty} of {int(position.qty)} at {float(price):.4f}"
+        if day_unknown:
+            if float(realized) < 0:
+                self.risk.register_realized_pnl(float(realized))
+            LOG.error("%s: closed while the bot was down: %s (realized %.2f), and the broker gives no fill time "
+                      "that reads (%r): booked at the restart's time, on a day it may not belong to, and %s",
+                      key, what, float(realized), state.get("filled_at"),
+                      "counted in the day's loss tally" if float(realized) < 0
+                      else "not counted in the day's loss tally (a gain of an unknown day)")
+        elif earlier_day:
+            LOG.warning("%s: closed while the bot was down: %s on %s (realized %.2f); booked at its fill time "
+                        "%s, in no figure of today's and not in today's loss tally", key, what, filled_at.date(),
+                        float(realized), filled_at.isoformat())
+        else:
+            self.risk.register_realized_pnl(float(realized))
+            LOG.warning("%s: closed while the bot was down: %s (realized %.2f); booked and counted in the day's "
+                        "loss tally", key, what, float(realized))
+
+    def _saved_stop_links(self, position: Position, bracket: dict[str, Any],
+                          first: dict[str, Any]) -> tuple[list[dict[str, Any]], bool, str]:
+        """The saved stop of a position the broker no longer holds (*first*:
+        its state, with its ``order_id``) and, while one reads REPLACED
+        (moved in the app, or by a replace of the bot's that returned no
+        new id), the order that replaced it, in turn: ``(states, unread,
+        lost)`` (2026-11-11). Until then a REPLACED saved stop read as one
+        that filled nothing, and its replacement's fill, the position's
+        actual close, was never booked.
+
+        The replacement is the one the running bot would follow
+        (``SchwabExecutor.replacement_of``: looked for among the orders
+        entered since the stop itself was, so a restart on a later day
+        finds it for a strategy that is flat by the close too; leaving out
+        the orders the saved record tracked before,
+        ``BRACKET_REPLACED_IDS_KEY``, and the ones followed here), read by
+        its id. *lost* says
+        where the chain could not be followed, "" when it was: *unread*
+        with it when a read failed (the orders, or the replacement's own
+        state; the caller keeps the row and fails the attempt), False when
+        the orders were read and no one replacement fits (the caller books
+        what was read and reports the rest)."""
+        links = [first]
+        symbol = str(position.metadata.get("underlying") or position.symbol)
+        seen = {str(first["order_id"])}
+        while order_status_class(links[-1].get("status")) == ORDER_REPLACED:
+            last_id = str(links[-1]["order_id"])
+            lookup = self.executor.replacement_of(
+                last_id, links[-1], symbol, position.side,
+                earlier=[*(bracket.get(BRACKET_REPLACED_IDS_KEY) or ()), *seen])
+            replacement_id = lookup.order_id
+            if replacement_id is None:
+                return links, lookup.unread, (
+                    f"stop {last_id} was REPLACED at the broker and its replacement is not found ({lookup.how})")
+            if replacement_id in seen:
+                return links, False, (f"stop {last_id} was REPLACED at the broker and its replacements come back "
+                                      f"to stop {replacement_id}")
+            state = self.executor.order_state(replacement_id)
+            if state is None:
+                return links, True, f"stop {replacement_id}, which replaced stop {last_id}, could not be read"
+            seen.add(replacement_id)
+            links.append({**state, "order_id": replacement_id})
+        return links, False, ""
+
+    def _cancel_orphan_stop(self, key: str, position: Position, bracket: dict[str, Any],
+                            links: list[dict[str, Any]]) -> bool:
+        """The saved stop of a position the broker no longer holds (the
+        last of *links*) may still rest: the position closed some other way
+        while the bot was down (sold in the app), and the bot's own stop
+        outlived it. It is cancelled here, with what else the saved record
+        tracks, and its final state read into *links* (2026-11-11). Until
+        then the row was pruned with the stop left working: the reconcile
+        read it as a foreign order and blocked entries until a human
+        cancelled it, and a restart whose order lookback did not reach it
+        left a sell stop resting against a flat account.
+
+        False, with the row kept and the attempt failed
+        (``_close_booking_error``), when the cancel is not confirmed or the
+        stop cannot be read after it (or reads REPLACED: moved meanwhile):
+        the retry cancels and reads again."""
+        end_id = str(links[-1]["order_id"])
+        chain = {str(link["order_id"]) for link in links}
+        cancel = self.executor.cancel_bracket({
+            **bracket, "stop_order_id": end_id,
+            "child_order_ids": [str(oid) for oid in bracket.get("child_order_ids") or [] if str(oid) not in chain]
+            + [end_id],
+        })
+        fresh = self.executor.order_state(end_id) if cancel.ok else None
+        if fresh is None or order_status_class(fresh.get("status")) == ORDER_REPLACED:
+            why = (f"its cancel was not confirmed ({cancel.message})" if not cancel.ok
+                   else "it could not be read after its cancel" if fresh is None
+                   else "it was REPLACED at the broker meanwhile")
+            self._close_booking_error = f"{key}: stop {end_id} still rested for a position the broker no longer holds, and {why}"
+            LOG.error("%s: %s %d at %.4f saved by the last run is not held by the broker, and its stop %s still "
+                      "rested (%s): %s. The row is kept; the retry cancels and reads it again", key,
+                      position.side.value, int(position.qty), float(position.entry_price), end_id,
+                      links[-1].get("status"), why)
+            return False
+        LOG.warning("%s: its stop %s still rested (%s) for a position the broker no longer holds; cancelled (%s)",
+                    key, end_id, links[-1].get("status"), cancel.message)
+        links[-1] = {**fresh, "order_id": end_id}
+        return True
 
     def _unconfirmed_stop_fill(self, key: str, position: Position,
                                record: dict[str, Any]) -> tuple[dict[str, Any] | None, bool, str]:
@@ -824,8 +976,10 @@ class StartupReconciler:
         not say what to look for (no submit time, price or quantity that
         reads; logged at ERROR, a submit time with its error's type).
         *unread* is True when the orders could not be read: the caller
-        keeps the row and fails the attempt. A replacement of that stop
-        (moved in the app) is not followed, as a saved stop's is not."""
+        keeps the row and fails the attempt. A stop that reads REPLACED
+        (moved in the app) carries the replacement its row names
+        (``replaced_by``) with its type and entry time, and the caller
+        follows it as it follows a saved stop's (``_saved_stop_links``)."""
         try:
             since = datetime.fromisoformat(str(record.get("sent_at"))) - timedelta(seconds=DISASTER_STOP_RETRY_SECONDS)
         except (TypeError, ValueError) as exc:
@@ -843,9 +997,11 @@ class StartupReconciler:
                                stop_price=record.get("stop_price"), qty=record.get("qty"))
         if match is None:
             return None, False, "is not among the account's orders"
-        return {"order_id": match.get("orderId"), "status": match.get("status"),
+        return {"order_id": str(match.get("orderId")), "status": match.get("status"),
                 "filled_qty": order_row_filled_qty(match), "fill_price": match.get("fillPrice"),
-                "fill_price_estimated": match.get("fillPriceEstimated"), "filled_at": match.get("filledAt")}, False, ""
+                "fill_price_estimated": match.get("fillPriceEstimated"), "filled_at": match.get("filledAt"),
+                "replaced_by": match.get("replacementId"), "order_type": match.get("orderType"),
+                "entered_at": order_entered_at(match)}, False, ""
 
     @staticmethod
     def _fill_time_while_down(state: dict[str, Any], position: Position, now: datetime) -> datetime | None:
@@ -1490,6 +1646,12 @@ class StartupReconciler:
             # reads its row as stale.
             self._book_positions_closed_while_down(raw_positions)
             working_orders = None if raw_orders is None else self._filter_reconcile_orders(raw_orders)
+            # A tracked position's protective order the broker lists
+            # REPLACED (its stop moved in the app since the last management
+            # pass) is followed to its replacement first: the settle's
+            # cancel then goes to the order that rests, and the replacement
+            # is the position's own below, not a foreign order (2026-11-11).
+            self._follow_replaced_children()
             # The settle needs the order list only to re-protect a bracketed
             # position, and waits for it there.
             exit_states_read = self._settle_positions_closed_at_broker(raw_positions, working_orders, set(unsettled))

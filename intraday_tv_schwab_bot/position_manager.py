@@ -47,6 +47,7 @@ from .audit_logger import AuditLogger, structured_metadata_snapshot
 from .config import BotConfig
 from .data_feed import EXECUTION_LAST_KEYS, MANAGEMENT_PRICE_KEYS, MarketDataStore
 from .execution import (
+    ReplacementLookup,
     BracketCancel,
     SchwabExecutor,
     order_result_left_nothing_live,
@@ -79,7 +80,9 @@ from .risk import RiskManager
 from .sr_snapshot import sr_snapshot
 from .trade_management import ProtectiveRead, TradeManager, TradeSpreads, protective_exit, protective_read
 from .broker_payloads import (
+    BRACKET_CHILD_KEYS,
     BRACKET_ID_KEYS,
+    BRACKET_REPLACED_IDS_KEY,
     DISASTER_STOP_REASON,
     DISASTER_SYNC_MODE,
     ORDER_DEAD,
@@ -94,6 +97,7 @@ from .broker_payloads import (
     exit_orders,
     is_disaster_stop,
     listed_stop,
+    note_replaced_order,
     order_may_be_live,
     order_result_needs_broker_recheck,
     order_row_filled_qty,
@@ -236,6 +240,17 @@ class PositionManager:
         # position whose orders could not be read, or whose leftover exit
         # orders' cancel is not confirmed; see _sweep_exit_orders.
         self._sweeps_owed: dict[str, dict[str, Any]] = {}
+        # By position key, the bracket children (their record keys) the
+        # broker reconcile followed to a replacement and left to the next
+        # management pass to size (follow_replaced_children): the reconcile
+        # has not compared the position with the account by then.
+        self._unsized: dict[str, set[str]] = {}
+        # A position was handed to the broker reconcile's settle (held with
+        # ``settle_pending``) by the follow of a REPLACED stop that found
+        # nothing left resting and shares sold by orders it cannot tell
+        # apart (_replaced_child_gone): the engine runs the reconcile on its
+        # next pass and clears this (IntradayBot._maybe_session_reconcile).
+        self.reconcile_wanted = False
         # When run_owed_sweeps last tried them (monotonic), None before.
         self._owed_sweeps_tried_at: float | None = None
         # Position key -> its recent spreads, the abnormal-book guard of a
@@ -1012,13 +1027,31 @@ class PositionManager:
         if bracket is None:
             return
         child_states: dict[str, dict[str, Any] | None] = {}
+        # The children followed to a replacement this pass, and why each
+        # one that reads REPLACED could not be (_follow_replaced_child); and
+        # the ones the broker reconcile followed and left to this pass to
+        # size (follow_replaced_children).
+        followed: dict[str, dict[str, Any]] = {}
+        unresolved: list[str] = []
+        unsized = self._unsized.pop(key, set())
         for child_key, reason in (("stop_order_id", protective_stop_reason(bracket)), ("target_order_id", "broker_target")):
             child_id = bracket.get(child_key)
             if not child_id:
                 continue
-            state = states.get(str(child_id))
-            if state is None:
-                state = self._unlisted_bracket_child_state(str(child_id))
+            state = self._bracket_child_state(str(child_id), states)
+            if isinstance(state, dict) and order_status_class(state.get("status")) == ORDER_REPLACED:
+                # It lives on in its replacement, which is tracked in its
+                # place before anything is booked or retired.
+                state, why = self._follow_replaced_child(key, position, bracket, child_key, state, states, bars)
+                if key not in self.positions or state is None:
+                    # Closed by the replaced order's own fills, or handed to
+                    # the broker reconcile's settle.
+                    return
+                if why is None:
+                    followed[child_key] = state
+                else:
+                    unresolved.append(why)
+                child_id = bracket.get(child_key)
             child_states[child_key] = state
             if not isinstance(state, dict) or not state.get("is_filled"):
                 continue
@@ -1069,7 +1102,15 @@ class PositionManager:
                     )
             break
         else:
-            self._track_resting_levels(key, bracket, child_states)
+            # One the reconcile left to size whose state does not read this
+            # pass waits for the next.
+            unread = {child_key for child_key in unsized
+                      if bracket.get(child_key) and not isinstance(child_states.get(child_key), dict)}
+            if unread:
+                self._unsized[key] = unread
+            followed = {**{child_key: child_states[child_key] for child_key in unsized - unread
+                           if isinstance(child_states.get(child_key), dict)}, **followed}
+            self._after_follow(key, position, bracket, child_states, followed, unresolved)
             stop_state = child_states.get("stop_order_id")
             if (bracket.get("failed_attempts") and bracket.get("state") in ("disaster_stop", "adopted")
                     and isinstance(stop_state, dict) and stop_state.get("status") in WORKING_STATUSES):
@@ -1082,6 +1123,478 @@ class PositionManager:
             # unconfirmed retire dropped a dead stop, what is left of it.
             guard_key = "stop_order_id" if bracket.get("stop_order_id") else "target_order_id"
             self._retire_dead_bracket(key, position, bracket, guard_key, child_states.get(guard_key), bars)
+
+    def _bracket_child_state(self, child_id: str, states: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+        """A bracket child's state row: the pass's listing's, else the
+        child read on its own (``_unlisted_bracket_child_state``). None when
+        neither gives it."""
+        state = states.get(child_id)
+        return state if state is not None else self._unlisted_bracket_child_state(child_id)
+
+    def follow_replaced_children(self) -> None:
+        """Follow every tracked position's REPLACED protective orders
+        (``_follow_replaced_child``): for the broker reconcile, ahead of its
+        settle and its foreign-order check (2026-11-11). The reconcile of a
+        new day runs before the day's first management pass, so the
+        replacement of a stop moved the evening before was a foreign order
+        to it (entries blocked for the day, and "clear them" meant
+        cancelling the position's only stop), and its settle sent its
+        cancel to the REPLACED id. A position held for the settle's retry
+        (``_settle_pending``) is followed too: its cancel waits on exactly
+        this.
+
+        The orders are read as a management pass reads them (the 8-hour
+        listing, else each child on its own), and nothing is read when no
+        position has live broker protection. A replacement's size is not
+        put right here: the settle that follows has yet to compare the
+        position with the account, and a resize to shares the account no
+        longer holds would rest more than is held. The next management
+        pass sizes it (``_unsized``). One whose follow raises is logged
+        with the type, and the others are followed."""
+        if self.config.schwab.dry_run:
+            return
+        states: dict[str, dict[str, Any]] | None = None
+        for key, position in list(self.positions.items()):
+            bracket = active_broker_bracket(position)
+            if bracket is None:
+                continue
+            if states is None:
+                states = self.executor.fetch_order_states() or {}
+            try:
+                child_states: dict[str, dict[str, Any] | None] = {}
+                followed: dict[str, dict[str, Any]] = {}
+                unresolved: list[str] = []
+                for child_key in BRACKET_CHILD_KEYS:
+                    if not bracket.get(child_key):
+                        continue
+                    state = self._bracket_child_state(str(bracket[child_key]), states)
+                    if isinstance(state, dict) and order_status_class(state.get("status")) == ORDER_REPLACED:
+                        state, why = self._follow_replaced_child(key, position, bracket, child_key, state, states, {})
+                        if key not in self.positions or state is None:
+                            break
+                        if why is None:
+                            followed[child_key] = state
+                        else:
+                            unresolved.append(why)
+                    child_states[child_key] = state
+                else:
+                    self._after_follow(key, position, bracket, child_states, {}, unresolved)
+                    if followed:
+                        self._unsized.setdefault(key, set()).update(followed)
+            except Exception as exc:
+                LOG.error("%s: following its REPLACED protective orders failed (%s: %s); what it had booked or "
+                          "re-pointed by then stands", key, type(exc).__name__, exc, exc_info=exc)
+
+    def _after_follow(self, key: str, position: Position, bracket: dict[str, Any],
+                      child_states: dict[str, dict[str, Any] | None], followed: dict[str, dict[str, Any]],
+                      unresolved: list[str]) -> None:
+        """Once *bracket*'s children are read and the REPLACED ones followed
+        (*followed*: child key to the state of the replacement to size;
+        *unresolved*: why each one that could not be followed was not):
+
+        - Count the pass as a miss when any is unresolved (once a pass,
+          however many are), on the record (``replacement_misses``), saved:
+          logged at ERROR, and every
+          ``execution.disaster_stop_escalation_attempts``-th ``ORDER REPLACED
+          UNTRACKED`` at CRITICAL. The position is held while the count
+          stands (``_replacement_unresolved``).
+        - End the hold when none is unresolved and every child was read: one
+          that cannot be read this pass may still be the REPLACED one.
+        - Record the levels the working children rest at
+          (``_track_resting_levels``: the price a stop was moved to is
+          kept), then put right a replacement of another size
+          (``_size_followed_children``)."""
+        if unresolved:
+            misses = int(bracket.get("replacement_misses") or 0) + 1
+            bracket["replacement_misses"] = misses
+            detail = f"{'; '.join(unresolved)} ({misses} consecutive time(s))"
+            LOG.error("%s: %s; no exit is sent and nothing is placed for it until it is", key, detail)
+            if misses % int(self.config.execution.disaster_stop_escalation_attempts) == 0:
+                LOG.critical("ORDER REPLACED UNTRACKED — %s: %s; the replacement may still rest untracked, and the "
+                             "position is held: no exit is sent for it. Check the account; the hold ends when the "
+                             "orders show one order that replaced it (cancel any other exit order on %s at the "
+                             "broker).", key, detail,
+                             str(position.metadata.get("underlying") or position.symbol))
+            self._save_reconcile_metadata()
+        elif all(isinstance(state, dict) for state in child_states.values()) \
+                and bracket.pop("replacement_misses", None) is not None:
+            self._save_reconcile_metadata()
+        self._track_resting_levels(key, bracket, child_states)
+        if followed:
+            self._size_followed_children(key, position, bracket, followed,
+                                         str(position.metadata.get("underlying") or position.symbol))
+
+    @staticmethod
+    def _never_its_replacement(position: Position, bracket: dict[str, Any]) -> set[str]:
+        """The orders that cannot be the replacement of one of *bracket*'s
+        REPLACED children, for the look among the orders
+        (``SchwabExecutor.replacement_of``): the ones the record tracked
+        before (``BRACKET_REPLACED_IDS_KEY``), every order it tracks now (a
+        bracket's target is no replacement of its stop), and the position's
+        working exit order."""
+        never = {str(oid) for oid in bracket.get(BRACKET_REPLACED_IDS_KEY) or ()} | bracket_order_ids(bracket)
+        working = position.metadata.get("working_exit_order") if isinstance(position.metadata, dict) else None
+        if isinstance(working, dict) and working.get("order_id"):
+            never.add(str(working["order_id"]))
+        return never
+
+    def _follow_replaced_child(self, key: str, position: Position, bracket: dict[str, Any], child_key: str,
+                               state: dict[str, Any], states: dict[str, dict[str, Any]],
+                               bars) -> tuple[dict[str, Any] | None, str | None]:
+        """Track, in place of a protective order of *bracket* the broker
+        lists REPLACED (*child_key*: its stop or its target, in *state*),
+        the order that replaced it (2026-11-11). Returns the state of the
+        order the record tracks under *child_key* from here, and None when
+        that is a replacement found, else why none was (it is still the
+        REPLACED one). The state is None when the position was handed to
+        the broker reconcile's settle instead (``_replaced_child_gone``).
+
+        Schwab does not edit an order: a stop moved in the app, or resized
+        by the bot with an answer that carried no new id
+        (``SchwabExecutor.replace_bracket_child``, ``new_id_unknown``), ends
+        as REPLACED and lives on in a new order. Until then the record kept
+        the old id for the rest of the hold: the fill reconcile read only
+        that id (a REPLACED order is neither filled nor dead), the cancel
+        before an exit read it as down, so the exit went out beside the
+        replacement, and the replacement's fill was never booked, so the
+        bot went on managing shares the account no longer held and its next
+        exit sold them short. For a good-till-cancelled disaster stop that
+        lasted days (F-0004).
+
+        In this order:
+
+        - Its own fills the record has not booked are booked first, as the
+          stop's (or the target's) exit, under the booked-fills ledger
+          (``_book_replaced_child_fills``): a later cancel that still lists
+          the old order reports nothing twice. The record stays active: the
+          rest lives on in the replacement. A booking that closes the
+          position leaves what still rests to its post-close sweep.
+        - The replacement is the one ``SchwabExecutor.replacement_of``
+          finds (the one the payload names, else the one among the orders
+          entered since it was), and its state must read (the pass's
+          listing, else a read of its own).
+        - The record's child id and its entry in ``child_order_ids`` are
+          re-pointed and saved, the id left behind added to the record's
+          ``replaced_order_ids`` (never taken for a later replacement). A
+          replacement that is itself REPLACED is followed in the same pass.
+
+        The caller then treats the replacement as the child it is: a fill
+        is booked, a dead one retired and re-placed, a working one's level
+        and size put right (``_after_follow``).
+
+        While the replacement is not found (none named and none or several
+        that fit, orders or a state that cannot be read, a chain that comes
+        back on itself) the caller counts the pass as a miss and the
+        position is held (``_after_follow``, ``_replacement_unresolved``):
+        ``_manage_position`` sends no exit and places nothing for it, as it
+        holds one whose working exit order's replacement is not found
+        (``_follow_replaced_exit``), until the orders show the replacement.
+        When they show instead that nothing entered after it can still rest
+        there is nothing to hold for, once they have shown it for a retry
+        interval (``_gone_long_enough``, ``_replaced_child_gone``)."""
+        symbol = str(position.metadata.get("underlying") or position.symbol)
+        child = "stop" if child_key == "stop_order_id" else "target"
+        seen: set[str] = set()
+        while True:
+            child_id = str(bracket[child_key])
+            seen.add(child_id)
+            priced = self._book_replaced_child_fills(key, position, bracket, child_key, child_id, state, bars)
+            if key not in self.positions:
+                return state, None
+            lookup = ReplacementLookup(None, "its own fills cannot be priced") if not priced else \
+                self.executor.replacement_of(child_id, state, symbol, position.side,
+                                             earlier=self._never_its_replacement(position, bracket))
+            if lookup.gone:
+                if self._gone_long_enough(key, bracket, child, child_id):
+                    return self._replaced_child_gone(key, position, bracket, child_key, child_id, state, lookup.sold)
+                return state, None
+            bracket.pop("replacement_gone_since", None)
+            replacement_id, how = lookup.order_id, lookup.how
+            replacement_state = None
+            if replacement_id is not None and replacement_id in seen:
+                replacement_id, how = None, f"its replacements come back to order {replacement_id}"
+            if replacement_id is not None:
+                replacement_state = self._bracket_child_state(replacement_id, states)
+                if replacement_state is None:
+                    replacement_id, how = None, f"its replacement {replacement_id} ({how}) could not be read"
+            if replacement_id is None:
+                return state, (f"its {child} order {child_id} was REPLACED at the broker and its replacement is "
+                               f"not found ({how})")
+            LOG.warning("Bracket %s %s for %s was REPLACED at the broker by order %s (%s), which is tracked in its "
+                        "place", child, child_id, key, replacement_id, how)
+            note_replaced_order(bracket, child_id)
+            bracket[child_key] = replacement_id
+            if str(bracket.get("protective_order_id") or "") == child_id:
+                # A lone protective stop is its own wrapper.
+                bracket["protective_order_id"] = replacement_id
+            children = [str(oid) for oid in (bracket.get("child_order_ids") or [])]
+            if child_id in children:
+                children[children.index(child_id)] = replacement_id
+            else:
+                children.append(replacement_id)
+            bracket["child_order_ids"] = children
+            self._save_reconcile_metadata()
+            state = replacement_state
+            if order_status_class(state.get("status")) != ORDER_REPLACED:
+                return state, None
+
+    def _gone_long_enough(self, key: str, bracket: dict[str, Any], child: str, child_id: str) -> bool:
+        """True once the orders have shown, for ``DISASTER_STOP_RETRY_SECONDS``
+        from the first such read, that nothing entered after the REPLACED
+        *child_id* can still rest (``ReplacementLookup.gone``): only then is
+        the record retired or the position handed to the settle
+        (``_replaced_child_gone``).
+
+        One read is not enough to act on. An order listing can run behind
+        the order's own state: the replacement of an order that already
+        reads REPLACED may not be listed yet, and with another, older exit
+        order listed after it (the third review's probe) that one read said
+        "nothing rests", a fresh stop went in, and the replacement surfaced
+        beside it: two resting stops, one untracked. The wait is the one a
+        submit with an unknown outcome is given to show in the orders. The
+        first read is stamped on the record (``replacement_gone_since``),
+        which holds the position meanwhile (``_replacement_unresolved``) and
+        is dropped by any read that finds the replacement or no longer says
+        gone. The wait is logged once, at WARNING, and is no miss."""
+        now = sessions.now_et()
+        since = bracket.get("replacement_gone_since")
+        if since is None:
+            bracket["replacement_gone_since"] = now.isoformat()
+            LOG.warning("%s: its %s order %s was REPLACED at the broker and the orders show nothing entered after it "
+                        "that can still rest; held for %.0f s in case they do not list its replacement yet", key,
+                        child, child_id, DISASTER_STOP_RETRY_SECONDS)
+            self._save_reconcile_metadata()
+            return False
+        return (now - datetime.fromisoformat(str(since))).total_seconds() >= DISASTER_STOP_RETRY_SECONDS
+
+    def _replaced_child_gone(self, key: str, position: Position, bracket: dict[str, Any], child_key: str,
+                             child_id: str, state: dict[str, Any],
+                             sold: int) -> tuple[dict[str, Any] | None, str | None]:
+        """A REPLACED protective order whose replacement cannot be told,
+        while the orders show that nothing entered after it can still rest
+        (``broker_payloads.nothing_rests_after``): every later exit order
+        on the symbol for the side filled or died. Nothing may rest
+        untracked, so there is nothing to hold the position for
+        (2026-11-11; the answer in ``_follow_replaced_child``'s shape).
+
+        - Those orders sold nothing (*sold* 0: the stop was changed into
+          another kind of order and then cancelled, say). A stop reads as
+          dead from here, and the caller's retire takes it down, with what
+          else the record tracks, and places a fresh one
+          (``_retire_dead_bracket``). A target is dropped from the record,
+          which keeps its stop: the engine owns the target again.
+        - They sold shares: which of them replaced it is not known, and one
+          of them may be a sale made by hand that the reconcile's settle
+          has booked or will, so nothing is booked from them here. The
+          record drops the order (``_drop_gone_child``) and stays active
+          only for what else it tracks (a bracket's other leg, which the
+          settle cancels); the position is held for the broker reconcile's
+          settle (``settle_pending``), which compares it with the account,
+          books what left it and lifts the hold, and the engine runs that
+          reconcile on its next pass (``reconcile_wanted``). The pass after
+          it places a stop for what is held.
+        - They sold shares and the broker reconcile is off
+          (``runtime.reconcile_on_startup`` false, or mode ``ignore``):
+          nothing would ever lift that hold, so the position is held as
+          one whose replacement is not found, and says so.
+
+        Until then every such position was held with no exit and no stop
+        until a restart."""
+        child = "stop" if child_key == "stop_order_id" else "target"
+        dead = {**state, "status": "CANCELED", "is_filled": False, "is_terminal_failure": True}
+        bracket.pop("replacement_gone_since", None)
+        if sold <= 0 and child == "stop":
+            LOG.warning("Bracket stop %s for %s was REPLACED at the broker and nothing entered after it can still "
+                        "rest (every later exit order died unfilled); it is retired as a dead stop", child_id, key)
+            return dead, None
+        runtime = self.config.runtime
+        if sold > 0 and (not runtime.reconcile_on_startup or runtime.startup_reconcile_mode == "ignore"):
+            return state, (f"its {child} order {child_id} was REPLACED at the broker and nothing entered after it "
+                           f"can still rest, but the order(s) entered after it sold {sold} share(s) the record "
+                           "cannot book, and the broker reconcile that would compare the position with the "
+                           "account is off")
+        self._drop_gone_child(bracket, child_key, child_id)
+        if sold <= 0:
+            LOG.warning("Bracket target %s for %s was REPLACED at the broker and nothing entered after it can still "
+                        "rest (every later exit order died unfilled); the record tracks no target from here, and "
+                        "the engine owns it", child_id, key)
+            self._save_reconcile_metadata()
+            return dead, None
+        bracket.pop("replacement_misses", None)
+        position.metadata["settle_pending"] = True
+        self.reconcile_wanted = True
+        LOG.error("%s: its %s order %s was REPLACED at the broker and nothing entered after it can still rest, but "
+                  "the order(s) entered after it sold %d share(s), and which of them replaced it is not known. "
+                  "Nothing is booked from them; the position is held for the broker reconcile, which compares it "
+                  "with the account", key, child, child_id, int(sold))
+        self._save_reconcile_metadata()
+        return None, None
+
+    @staticmethod
+    def _drop_gone_child(bracket: dict[str, Any], child_key: str, child_id: str) -> None:
+        """Take *child_id*, a protective order nothing of which rests any
+        more (``_replaced_child_gone``), off *bracket*: its child key, its
+        entry in ``child_order_ids``, and the wrapper id when it was its
+        own wrapper; it is noted among the orders the record left behind.
+        A dropped stop is recorded as a dead one (``dead_stop_status``), as
+        the retire records one it dropped. The record stays active only
+        while it tracks another order (a bracket's other leg, its OCO): a
+        record marked down with a leg still resting left that leg
+        untracked (the third review's probe)."""
+        bracket[child_key] = None
+        bracket["child_order_ids"] = [str(oid) for oid in bracket.get("child_order_ids") or [] if str(oid) != child_id]
+        if str(bracket.get("protective_order_id") or "") == child_id:
+            bracket["protective_order_id"] = None
+        note_replaced_order(bracket, child_id)
+        child = "stop" if child_key == "stop_order_id" else "target"
+        if child == "stop":
+            bracket["dead_stop_status"] = "CANCELED"
+        bracket["state"] = f"{child}_replaced"
+        if not bracket_order_ids(bracket):
+            bracket["active"] = False
+
+    def _book_replaced_child_fills(self, key: str, position: Position, bracket: dict[str, Any], child_key: str,
+                                   child_id: str, state: dict[str, Any], bars) -> bool:
+        """Book what a REPLACED protective order (``_follow_replaced_child``)
+        filled itself and the record has not booked: the fills beyond its
+        ledger entry, priced as their own (``unbooked_fill_price``; the
+        level it rested at when the broker gives no price, as the fill
+        reconcile books one), as the exit of its kind. The ledger takes them
+        before the booking, so a booking that raises is not made twice. A
+        booking that closes the position leaves its replacement, and what
+        else the record tracked, to the post-close sweep that booking runs
+        (``_sweep_exit_orders``: every exit order still working on the
+        symbol, retried until it is down). False, with nothing booked, when
+        no price is available for them."""
+        booked_qty, booked_notional, booked_estimated = booked_child_part(bracket, child_id)
+        filled = int(state.get("filled_qty") or 0)
+        if filled <= booked_qty:
+            return True
+        unbooked = filled - booked_qty
+        reason = protective_stop_reason(bracket) if child_key == "stop_order_id" else "broker_target"
+        fill_price, fill_price_estimated = unbooked_fill_price(
+            filled, safe_float(state.get("fill_price"), None, finite=True),
+            state.get("fill_price_estimated") is not False, booked_qty, booked_notional, booked_estimated,
+            what=f"{reason} order {child_id} for {key}")
+        level = bracket.get("stop_price") if child_key == "stop_order_id" else bracket.get("target_price")
+        exit_price = fill_price if fill_price is not None else safe_float(level, None, finite=True)
+        if exit_price is None:
+            return False
+        add_booked_child_fill(bracket, child_id, unbooked, fill_price, fill_price_estimated)
+        LOG.warning("Bracket %s order %s for %s was REPLACED at the broker having filled %s share(s); booking the %s "
+                    "not booked yet", reason, child_id, key, filled, unbooked)
+        self._book_broker_exit(
+            key, position, self._held_part_of_fill(key, position, unbooked, f"{reason} order {child_id}"),
+            float(exit_price), ExitDecision(reason, "risk"), bars,
+            result_message="bracket_child_filled_before_replace", attempt_status="broker_bracket",
+            fill_price_estimated=fill_price_estimated, exit_limits_missed=None,
+        )
+        return True
+
+    def _size_followed_children(self, key: str, position: Position, bracket: dict[str, Any],
+                                followed: dict[str, dict[str, Any]], symbol: str) -> None:
+        """Put right the size of the replacements ``_follow_replaced_child``
+        took for *bracket*'s children (*followed*: child key to the
+        replacement's state), as an adopted stop of another size is put
+        right (``SchwabExecutor.ensure_position_protected``).
+
+        A replacement that may still rest should rest the shares no working
+        exit order covers. One that rests more (the quantity was changed in
+        the app), or whose size does not read, would sell more than is
+        held, so the children are re-issued at once at that size
+        (``resize_bracket_children``, as the bot's own orders, at the
+        levels the record holds: the price a stop was moved to, just
+        recorded): beside a working exit order too, where a stop left
+        larger would sell its shares a second time. One that rests fewer is
+        left as it is, logged, the record's ``qty`` saying what rests: the
+        bot enlarges no order it did not size (shares sold by hand leave
+        its own count too high until the next broker reconcile). When a
+        resize is
+        not confirmed the record reads ``qty_mismatch`` (``qty_unverified``
+        when the size does not read) at the size it rests: at ERROR for a
+        bracket, and for a disaster stop as a miss, so
+        ``ensure_disaster_stop`` resizes it again a retry interval later, or
+        cancels it and places one. Outside the regular session, where the
+        broker takes no STOP, a disaster stop's record is only marked, and
+        the first regular-session pass resizes it.
+
+        One that has filled shares the record has not booked is left as it
+        is: it is executing, and its fill is booked when it completes. One
+        that filled or died is the fill booking's or the retire's."""
+        expected = int(position.qty) - working_exit_outstanding_qty(position)
+        wrong: list[tuple[str, int | None]] = []
+        right = 0
+        for child_key, state in followed.items():
+            if order_status_class(state.get("status")) != ORDER_LIVE:
+                continue
+            filled = int(state.get("filled_qty") or 0)
+            if filled > booked_child_part(bracket, bracket[child_key])[0]:
+                continue
+            remaining, leg_qty = state.get("remaining_qty"), state.get("leg_qty")
+            resting = remaining if remaining is not None else None if leg_qty is None else int(leg_qty) - filled
+            if resting is None or int(resting) != expected:
+                wrong.append((child_key, None if resting is None else int(resting)))
+            else:
+                right += 1
+        if expected < 1:
+            return
+        if not wrong:
+            if right == len(followed) and bracket.get("qty") != expected:
+                # What the record says rests is what does: the replacement
+                # holds what the original had left.
+                bracket["qty"] = expected
+                self._save_reconcile_metadata()
+            return
+        resting = wrong[0][1]
+        bracket["qty"] = resting
+        missized = "qty_mismatch" if resting is not None else "qty_unverified"
+        named = ", ".join(f"{'stop' if child_key == 'stop_order_id' else 'target'} {bracket[child_key]} rests "
+                          f"{'an unknown number of' if size is None else size}" for child_key, size in wrong)
+        if all(size is not None and size < expected for _child_key, size in wrong):
+            # Fewer than it should cover: left as it was sized at the
+            # broker. The bot's own count is too high once shares were sold
+            # by hand (until the next broker reconcile), and enlarging the
+            # stop to it would rest more than the account holds. The
+            # engine's own stop still covers every share while the bot runs.
+            LOG.warning("%s: the replacement followed rests fewer than the %s share(s) it should cover (%s); it "
+                        "is left as it was sized at the broker, and the record says so", key, expected, named)
+            self._save_reconcile_metadata()
+            return
+        disaster = is_disaster_stop(bracket)
+        if disaster and not self.executor.regular_session_open():
+            bracket["state"] = missized
+            LOG.warning("Disaster stop for %s: the replacement followed is of another size than the %s share(s) it "
+                        "should cover (%s); it is resized by the first regular-session pass", key, expected, named)
+            self._save_reconcile_metadata()
+            return
+        resized, message = self.executor.resize_bracket_children(
+            bracket, symbol, position.side, expected, "NORMAL" if disaster else str(bracket.get("session") or "NORMAL"),
+            initial_risk=None if disaster else initial_risk_per_unit(position))
+        if resized:
+            LOG.warning("%s: the replacement followed was of another size than the %s share(s) it should cover "
+                        "(%s); resized (%s)", key, expected, named, message)
+            self._save_reconcile_metadata()
+            return
+        bracket["state"] = missized
+        detail = (f"the replacement followed is of another size than the {expected} share(s) it should cover "
+                  f"({named}) and could not be resized ({message})")
+        if disaster:
+            self._disaster_stop_missed(key, bracket, int(bracket.get("failed_attempts") or 0) + 1,
+                                       sessions.now_et(), logging.ERROR, detail)
+            return
+        LOG.error("%s: %s -- a resting exit larger than the position would flip it on trigger", key, detail)
+        self._save_reconcile_metadata()
+
+    @staticmethod
+    def _replacement_unresolved(position: Position) -> bool:
+        """True while the position's live broker protection tracks an order
+        the broker lists REPLACED whose replacement is not found
+        (``_follow_replaced_child``, ``_after_follow``), or is waited for
+        (``_gone_long_enough``): that replacement may rest, so an
+        exit would sell beside it and a placement would rest a second stop.
+        Nothing is sent for the position until a pass finds it."""
+        bracket = active_broker_bracket(position)
+        return bracket is not None and bool(bracket.get("replacement_misses") or bracket.get("replacement_gone_since"))
 
     @staticmethod
     def _track_resting_levels(key: str, bracket: dict[str, Any],
@@ -2133,7 +2646,8 @@ class PositionManager:
             return self._follow_replaced_exit(key, position, record, state)
         if state.get("is_filled") or state.get("is_terminal_failure"):
             position.metadata.pop("working_exit_order", None)
-            if record.get("reprotect") and not self._disaster_stop_unconfirmed(position):
+            if record.get("reprotect") and not self._disaster_stop_unconfirmed(position) \
+                    and not self._replacement_unresolved(position):
                 # The order is settled and the position is still held. The
                 # submit-time path re-protects a booked exit's remainder;
                 # this is that step for an order that was left working, whose
@@ -2144,7 +2658,9 @@ class PositionManager:
                 # is left to ensure_disaster_stop, which looks for it (books
                 # what it sold, adopts it) before it places another: placed
                 # here, a second stop rested beside the one that landed, and
-                # the fills of that one were never booked (2026-09-29).
+                # the fills of that one were never booked (2026-09-29). Nor
+                # beside a resting stop that was REPLACED and whose
+                # replacement is not found yet (_follow_replaced_child).
                 self._reprotect_remainder(position)
             self._save_reconcile_metadata()
             return False
@@ -2315,6 +2831,7 @@ class PositionManager:
                 self._position_failed(key, "its management", exc, failures, rest_runs=False)
         self._escalate_failures(failures)
         self._looks = {key: look for key, look in self._looks.items() if key in self.positions}
+        self._unsized = {key: children for key, children in self._unsized.items() if key in self.positions}
         self._trade_spreads = {key: spreads for key, spreads in self._trade_spreads.items() if key in self.positions}
         self._save_reconcile_metadata()
 
@@ -2417,6 +2934,18 @@ class PositionManager:
             # (_working_slice_remainder_exit) is on the record like any
             # other. Until 2026-09-28 the next pass reset it unlogged.
             self._log_position_adjustments(key, position, last_price, previous_look, look)
+            return
+        if self._replacement_unresolved(position):
+            # Its resting stop (or target) was REPLACED at the broker and
+            # the replacement is not found: it may rest, so no exit goes out
+            # beside it and nothing is placed beside it. The fill reconcile
+            # looks for it again at the head of every pass, and says so.
+            self.audit.log_cycle(
+                f"exit_gate:{key}", "bracket_replacement_unknown",
+                f"Exit held {key}: a resting protective order was REPLACED at the broker and its replacement is not "
+                "found",
+                interval=60.0, level=TRADEFLOW_LEVEL,
+            )
             return
         management_symbol = str(position.metadata.get("underlying") or position.symbol)
         management_frame = bars.get(management_symbol)
