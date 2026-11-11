@@ -9,6 +9,63 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The live path for a position held across sessions (2026-11-10; built,
+  not enabled).** Three things in the live path assumed a position is flat
+  by the close. Two now follow the manifest capability
+  `capabilities.holding` (`BotConfig.active_holds_across_sessions`, never a
+  strategy's name); the third is the "Fixed" entry below. No live strategy
+  uses them yet: `swing_leader_pullback`, the one strategy that declares
+  the capability, still refuses `schwab.dry_run: false`, until the broker's
+  handling of a good-till-cancelled stop is checked by hand.
+  - *The disaster stop is good-till-cancelled.* For such a strategy the
+    plain `STOP` is sent `GOOD_TILL_CANCEL`, regular session
+    (`SchwabExecutor.disaster_stop_duration`), on a placement and on a
+    resize; `_bracket_stop_child` takes a required `duration`, and a
+    bracket's stop is always `DAY`. A `DAY` stop expires at each close, so
+    the position opened the next session with no stop until the bot's
+    first pass, and had none on a day the bot was down. Because the stop
+    outlives the day, the two reads that look for a stop no record tracks
+    (before a placement, in the sweep after a close:
+    `SchwabExecutor.resting_stop_orders`) go
+    `runtime.startup_order_lookback_days` back for such a strategy, not
+    from midnight ET: a stop moved in the app on an earlier day rests under
+    a new id, and read from midnight it was not listed, so a second stop
+    went in beside it and the sweep after a close left it working. A sweep
+    still owed when the regular session ends is tried again while the
+    broker takes orders, once a minute and ahead of each broker reconcile
+    (`PositionManager.run_owed_sweeps`), and
+    the stop an unconfirmed submit left resting overnight is the position's
+    own at the next day's reconcile, not a foreign order. Every other
+    strategy keeps its `DAY` order, byte for byte, and its reads from
+    midnight.
+  - *A live config must restart the right way.* With `schwab.dry_run:
+    false` the load refuses a config for such a strategy
+    (`_validate_cross_session_hold`) unless
+    `runtime.reconcile_on_startup` is true with `startup_reconcile_mode:
+    restore_hybrid` (the one mode that restores a position with its entry
+    time, stop and stop order), `runtime.session_reconcile_on_resume` is
+    true, `execution.disaster_stop_enabled` is true,
+    `execution.extended_hours_enabled` is false (an exit there cancels the
+    resting stop, and none can be placed again before 09:30), and
+    `runtime.startup_order_lookback_days` is at least `ceil(1.5 x the
+    hold's bound in sessions) + 5` (`cross_session_order_lookback_days`; 20
+    for the swing strategy's ten sessions) and at most 365. Every rule
+    broken is named in the one error. A dry run is not checked, and the
+    swing preset keeps its dry-run values.
+  - *A carried position the account no longer matches fails the restart's
+    attempt.* In a live run of such a strategy, an account row that matches
+    none of the rows the strategy saved on that symbol (its stop sold part
+    of it while the bot was down, a split) is not restored at a guess: the
+    attempt fails naming both, the saved row is kept, nothing is sent, and
+    entries stay blocked until the two agree; it is named once at CRITICAL
+    (`CARRIED POSITION UNMANAGED`). Until then the account row was skipped
+    and the saved row pruned as stale. A row whose last writer was a dry
+    run is left out of this rule.
+  Not closed, and required before a live run: a stop moved in the app is
+  not followed while the bot runs (its replacement rests untracked, and its
+  fill is not seen), a gap older than this change that a
+  good-till-cancelled stop stretches from one session to the whole hold.
+
 - **A dry-run restart keeps the paper positions of a strategy that holds
   across sessions (2026-11-10).** A strategy declares the hold in its
   manifest, `capabilities.holding: {"across_sessions": true,
@@ -290,6 +347,40 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sets the removed knob refuses to load, naming the gate.
 
 ### Fixed
+
+- **A broker stop that filled on an earlier day while the bot was down is
+  booked (2026-11-10).** At a live restart a saved position the account no
+  longer holds is booked from its stop's own fill
+  (`StartupReconciler._book_positions_closed_while_down`). The position's
+  entry day stood in for the fill's day (a `DAY` stop fills the day it is
+  entered), so a position entered before today was reported at ERROR and
+  never booked: a stop that filled yesterday afternoon with the bot down
+  was in no trade, a position carried overnight by a restore mode and
+  stopped today was not booked either, and a good-till-cancelled stop
+  could never have been booked. The day the stop filled now decides, for
+  every strategy (the
+  fill's time: `broker_payloads.order_filled_at`, the newest execution's
+  `time` when every execution carries one, else a FILLED order's
+  `closeTime`, carried as `filled_at` / `filledAt` on the order rows):
+  - today: as before, stamped at the restart, in the day's figures and the
+    `max_daily_loss` tally, gain or loss;
+  - an earlier day: booked with the fill's time as the trade's exit time
+    (`PaperAccount.record_exit(exit_time=...)`; None stamps now, as every
+    other caller does), so it is in trades.csv under its own date and in
+    the run's realized P&L, in no day's figures and not in today's tally;
+  - no fill time that reads, on a position entered before today: booked at
+    the restart's time, named at ERROR, and counted in the tally only when
+    it is a loss. A position entered today filled today whatever the
+    payload says of the time, and is booked as before.
+  A saved disaster stop record that was still `unconfirmed` is looked up
+  among the orders entered from a minute before its submit, where it read
+  "no stop order saved" and was not booked. What the running bot had
+  booked of the stop before it stopped is left out and the rest priced as
+  its own fills, where the saved quantity was booked at the order's whole
+  average. A booked row whose delete fails is not booked again by a retry.
+  The broker's two time fields are its order schema's names and have not
+  been read off a live fill; a restart on a weekend or a holiday books a
+  fill of the last trading day into that day's figures.
 
 - **The rest of top_tier's knobs are checked at load (2026-11-10; the
   whole-bot review's R-092 and R-079, deferred on 2026-11-08).** 32
