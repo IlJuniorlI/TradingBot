@@ -634,7 +634,9 @@ class PaperAccount:
         or the day rolled first): the positions of the day's row it did not
         restore leave the row, each logged with its move up to the restart,
         which stays in the day's P&L, never realized and in no trade (a
-        dry run restores no paper position). Nothing after the first call."""
+        dry run restores a paper position only for a strategy that holds
+        across sessions, ``StartupReconciler.restore_paper_positions``).
+        Nothing after the first call."""
         with self._lock:
             dropped = list(self._carried_positions.items()) + self._carried_unmatched
             self._carried_positions = {}

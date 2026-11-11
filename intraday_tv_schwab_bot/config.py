@@ -31,6 +31,7 @@ from .serialization import read_yaml
 from ._strategies.catalogue import (
     default_strategy_name,
     get_plugins,
+    holds_across_sessions,
     is_option_strategy,
     normalize_strategy_name,
     plugin_names,
@@ -1636,6 +1637,13 @@ class BotConfig:
         runtime reads no plugin catalogue. A signal or a position is an
         option by its own metadata (``models.is_option_asset``)."""
         return is_option_strategy(self.strategy)
+
+    @property
+    def active_holds_across_sessions(self) -> bool:
+        """Whether the active strategy carries positions across sessions
+        (its manifest's ``capabilities.holding``): the one such check, so
+        the runtime reads no plugin catalogue and names no strategy."""
+        return holds_across_sessions(self.strategy)
 
 
 def _strategy_defaults() -> dict[str, StrategyConfig]:

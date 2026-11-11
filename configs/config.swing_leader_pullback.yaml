@@ -100,7 +100,11 @@ runtime:
   equity_session_indicator_window: rth
   warmup_minutes: 150
   prewarm_before_windows_minutes: 15
-  log_dir: .logs
+  # Its own folder for logs, trades.csv, the day's figures and the saved
+  # positions: a second bot started from the same directory (top_tier on
+  # .logs) would otherwise share them, and its first save would delete this
+  # strategy's saved positions, the ones a restart takes back.
+  log_dir: .logs_swing
   stream_fields:
   - 0
   - 1
@@ -115,8 +119,8 @@ runtime:
   stream_fallback_poll_seconds: 25
   stream_stale_fallback_seconds: 180
   stream_health_log_seconds: 90
-  # false: the process must stay up to carry positions (a dry-run restart
-  # restores no paper position).
+  # false: the process stays up to carry its positions. A restart takes the
+  # open paper positions back, but nothing is simulated while it is down.
   auto_exit_after_session: false
   idle_sleep_seconds: 60.0
   symbol_state_prune_seconds: 1800.0
@@ -132,7 +136,7 @@ runtime:
   startup_reconcile_mode: ignore
   startup_order_lookback_days: 2
   startup_reconcile_ignore_symbols: []
-  startup_reconcile_metadata_db_path: .logs/startup_reconcile_metadata.sqlite
+  startup_reconcile_metadata_db_path: .logs_swing/startup_reconcile_metadata.sqlite
 execution:
   entry_limit_min_buffer: 0.03
   entry_limit_max_buffer: 0.05
@@ -199,7 +203,7 @@ dashboard:
   host: 127.0.0.1
   port: 8765
   refresh_ms: 1500
-  state_path: .logs/dashboard_state.json
+  state_path: .logs_swing/dashboard_state.json
   client_idle_seconds: 30.0
   idle_publish_seconds: 60.0
   state_write_seconds: 30

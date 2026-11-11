@@ -41,5 +41,15 @@
     "exit_sma": 5,
     "max_hold_sessions": 10,
     "exit_check_time": "15:50"
+  },
+  "capabilities": {
+    "holding": {
+      "across_sessions": true,
+      "max_sessions_param": "max_hold_sessions"
+    },
+    "startup_restore": {
+      "eligible_symbols_source": "all",
+      "require_hybrid_metadata": true
+    }
   }
 }

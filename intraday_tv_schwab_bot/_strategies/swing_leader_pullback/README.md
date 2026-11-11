@@ -62,12 +62,22 @@ Every knob is checked when the config loads and again when the strategy is built
 
 ## What is not built
 
-- **A dry-run restart drops the open paper positions.** Nothing restores them: the preset's `startup_reconcile_mode: ignore` reconciles nothing, and the restore modes read the broker account, which holds no paper shares. The day ledger logs the drop when the day's row had been written. Keep the process up, or expect the record to lose the positions open at a restart.
+- **Nothing is simulated while the bot is down.** A dry-run restart takes the open paper positions back (below), but a stop crossed while it was down exits at the first pass's price, not at the stop, and an exit check that came due is judged at the next one.
 - **Live trading is refused at build** (`schwab.dry_run` must be true). The live path is not built for a multi-day hold: the resting disaster stop is a DAY order that expires at each close, so nothing protects the position overnight while the bot is down; a position closed by that stop on a later day while the bot is down is not booked; and only `restore_hybrid` restores a position with its stop and entry session.
 - **The whole exit day carries the trade's P&L.** A multi-day trade's realized P&L lands on its exit day, in the risk tally and the day ledger.
 - **Earnings are not avoided.** The strategy does not read the event calendar: an entry can come the session before a report and a hold can span one, as the study's trades did.
 - **About 50 leaders are streamed from 09:00 to 10:00.** Every candidate joins the watchlist for the entry hour, though only a few have a setup on a given day.
 - **A fill beyond the signal's own levels books the default levels.** The entry stage's fallback (`risk.default_stop_pct` / `default_target_pct`) replaces the stop and adds a target when the fill lands past the stop; with a stop 2 daily ATRs away that needs a gap of about 6% between the signal and the fill.
+
+## A dry-run restart
+
+The strategy declares that it holds across sessions (`capabilities.holding` in its manifest: `across_sessions: true`, and `max_sessions_param: max_hold_sessions`, the knob that bounds a hold). For such a strategy, in a dry run, the run's first reconcile takes back the paper positions the earlier process saved (`StartupReconciler.restore_paper_positions`, 2026-11-10): each is tracked as saved, with its entry time, stop and metadata, and entered in the paper account at its entry price, so the hold is still counted from the entry's own session. The log names each restored position and when its row was last saved.
+
+A saved row is restored only when this strategy's dry run wrote it. Refused, each at ERROR with the reason, and dropped at the next save: another strategy's row, a row a live run wrote (or one saved before rows carried that mark), an option position, a row with an exit order working or a stop record that is not a dry run's, a quantity, entry or stop that does not read, and a key already tracked. A store that cannot be read fails the start-up: started empty, the first save would wipe the rows.
+
+Two limits. The preset keeps its state in its own folder (`runtime.log_dir: .logs_swing`, with the saved positions, trades.csv and the day's figures): another bot writing the same file would delete this strategy's saved rows at its first save, and a restart would then find nothing to take back, without a word. And after a restart on a later day the day's P&L counts a restored position from its first mark, so the move while the bot was down is in no day's figure; it is in the trade's result and the run's.
+
+Until 2026-11-10 nothing restored a paper position: the restore modes walk the broker account, which holds no paper share, and the first reconcile's save replaced the saved rows with an empty book. That is still what happens for every strategy that is flat by the close.
 
 ## Default windows (the manifest's and the preset's)
 

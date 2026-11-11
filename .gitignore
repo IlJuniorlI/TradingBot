@@ -16,6 +16,7 @@ env/
 
 # Bot logs and runtime state
 .logs/
+.logs_swing/
 
 # IDE
 .idea/

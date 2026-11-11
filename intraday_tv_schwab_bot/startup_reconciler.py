@@ -1121,6 +1121,85 @@ class StartupReconciler:
         return restored, skipped, unusable
 
     # ------------------------------------------------------------------
+    # Paper positions at a dry-run restart
+    # ------------------------------------------------------------------
+
+    def _paper_restore_refusal(self, key: str, position: Position, paper: bool) -> str | None:
+        """Why a saved row is not a paper position to take back, or None.
+        Only a row this strategy's dry run wrote, of an equity position
+        with nothing working at the broker and levels that read."""
+        if position.strategy != self.config.strategy:
+            return f"another strategy's row ({position.strategy})"
+        if not paper:
+            return "not written by a dry run"
+        metadata = position.metadata if isinstance(position.metadata, dict) else {}
+        if asset_type_of(metadata) != ASSET_TYPE_EQUITY:
+            return f"not an equity position ({asset_type_of(metadata)})"
+        if metadata.get("working_exit_order"):
+            return "an exit order was working"
+        bracket = metadata.get("bracket")
+        if bracket is not None and not (isinstance(bracket, dict) and bracket.get("simulated") is True):
+            return "its stop record is not a dry run's"
+        if int(position.qty) <= 0 or not float(position.entry_price) > 0.0 or not float(position.stop_price) > 0.0:
+            return (f"its quantity, entry or stop does not read (qty={position.qty}, entry={position.entry_price}, "
+                    f"stop={position.stop_price})")
+        if key in self.positions:
+            return "its key is already tracked"
+        return None
+
+    def restore_paper_positions(self) -> int:
+        """A dry run of a strategy that holds across sessions takes back the
+        paper positions the earlier process saved (2026-11-10); the number
+        restored. Called once at start-up, ahead of the first reconcile:
+        the restore modes walk the broker account, which holds no paper
+        share, and the first successful reconcile's save replaces the saved
+        rows with what is tracked, so until then every position open at a
+        restart left the record.
+
+        Each accepted row is tracked as saved (its entry time, stop and
+        metadata) and entered in the paper account at its entry price
+        (``PaperAccount.record_restored_entry``, which also takes it back
+        into the day's row when the row held it; on a later day the day's
+        P&L counts its move from its first mark after the restore, so the
+        gap while the bot was down is in no day's figure, though it is in
+        the trade's and the run's). Nothing was simulated
+        while the bot was down: a stop crossed meanwhile exits at the first
+        pass's price, and the log names each row's last save. A row that is
+        not such a position (``_paper_restore_refusal``) is refused at
+        ERROR and left to that save to drop. An unreadable store raises:
+        the start-up fails rather than start empty and wipe the rows. Any
+        other run (live, or a strategy flat by the close) restores nothing
+        here."""
+        if not (self.config.schwab.dry_run and self.config.active_holds_across_sessions):
+            return 0
+        restored = 0
+        for row in self.reconcile_metadata_store.load_paper_rows():
+            key, position = str(row["key"]), row["position"]
+            refusal = self._paper_restore_refusal(key, position, bool(row["paper"]))
+            if refusal is not None:
+                LOG.error("Paper restore: the saved row %s (%s %s %s) is not restored: %s. It leaves the store at "
+                          "the next save.", key, position.symbol, position.side.value, position.qty, refusal)
+                continue
+            metadata = dict(position.metadata or {})
+            metadata.update({"restored_on_startup": True, "restored_mode": "paper", "restored_from_metadata": True})
+            # The price its disaster stop would rest at, as the hybrid
+            # restore stamps it: a row saved before the entry stamped one
+            # gets it here, one that carries it keeps its own.
+            initial_stop = safe_float(metadata.get("initial_stop_price"), None, finite=True)
+            self.executor.stamp_disaster_stop_price(
+                metadata, position.side, float(position.entry_price),
+                float(position.stop_price) if initial_stop is None else initial_stop)
+            position.metadata = metadata
+            self.positions[key] = position
+            self.account.record_restored_entry(position, float(position.entry_price))
+            restored += 1
+            LOG.warning("Paper restore: %s %s %d @ %.4f, entered %s, stop %.4f, restored from its row (last saved "
+                        "%s). Nothing was simulated since: a stop crossed meanwhile exits at the first pass's price.",
+                        position.symbol, position.side.value, int(position.qty), float(position.entry_price),
+                        position.entry_time.isoformat(timespec="seconds"), float(position.stop_price),
+                        row["updated_at"] or "unknown")
+        return restored
+
     # Main entry point — called once from engine.run() before step loop.
     # ------------------------------------------------------------------
 

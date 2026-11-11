@@ -443,7 +443,8 @@ class IntradayBot:
             else None
         )
         self.positions: dict[str, Position] = {}
-        self.reconcile_metadata_store = ReconcileMetadataStore(config.runtime.startup_reconcile_metadata_db_path)
+        self.reconcile_metadata_store = ReconcileMetadataStore(config.runtime.startup_reconcile_metadata_db_path,
+                                                               dry_run=bool(config.schwab.dry_run))
         self.started_at = sessions.now_et()
         self.last_candidates: list[Candidate] = []
         self.last_watchlist: list[str] = []
@@ -499,6 +500,9 @@ class IntradayBot:
         # happened during the 8pm-7am gap (manual position closes
         # via the Schwab app, server-side stop fills, etc.).
         self._last_reconcile_session_date: date | None = None
+        # Whether the run's first reconcile attempt has still to take back a
+        # dry run's paper positions (_reconcile_broker).
+        self._paper_restore_pending = True
         # Failed reconcile attempts in a row; while it is non-zero,
         # `_maybe_session_reconcile` retries on `_reconcile_retry_delay()`.
         self._reconcile_failures = 0
@@ -1255,6 +1259,15 @@ class IntradayBot:
         """Run the broker reconcile once. Success stamps ``session_date`` as
         reconciled and saves the reconcile metadata; failure leaves both and
         schedules a retry."""
+        if self._paper_restore_pending:
+            # Once a run, ahead of its first reconcile attempt: a dry run of
+            # a strategy that holds across sessions takes back the paper
+            # positions the earlier process saved (2026-11-10), before this
+            # method's first success replaces the saved rows with what is
+            # tracked. A store that cannot be read raises, and the start-up
+            # fails with it: started empty, that save would wipe the rows.
+            self.startup_reconciler.restore_paper_positions()
+            self._paper_restore_pending = False
         ok = self.startup_reconciler.reconcile()
         # The retry delay runs from the END of the attempt, so an attempt that
         # hangs for longer than the delay is not re-fired at once.

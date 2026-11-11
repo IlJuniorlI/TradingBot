@@ -6,7 +6,7 @@ the classes a manifest names.
 """
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from functools import lru_cache
 import json
@@ -195,7 +195,48 @@ def _validate_signal_priority_capability(raw: object, *, manifest_path: Path) ->
         )
 
 
-def _coerce_capabilities(raw: object, *, manifest_path: Path) -> dict[str, object]:
+_HOLDING_KEYS = frozenset({"across_sessions", "max_sessions_param"})
+
+
+def _validate_holding_capability(raw: object, *, restore: object, params: Mapping[str, object],
+                                 manifest_path: Path) -> None:
+    """``capabilities.holding``: whether the strategy carries positions
+    across sessions (``across_sessions``, a boolean, required) and, when it
+    does, the param that bounds a hold in sessions (``max_sessions_param``,
+    the name of a whole-number manifest param). The engine reads it, never a
+    strategy's name: the resting disaster stop's duration, the order
+    look-back a live config must cover, the restore of paper positions at a
+    dry-run restart. A strategy that holds across sessions must also set
+    ``capabilities.startup_restore.require_hybrid_metadata``: a carried
+    position restored without its saved row would lose its stop and its
+    entry session, and a broker holding the bot never opened would be
+    managed as its own."""
+    field = "capabilities.holding"
+    if not isinstance(raw, dict):
+        raise TypeError(f"{manifest_path}: '{field}' must be an object")
+    unknown = sorted(str(key) for key in raw if key not in _HOLDING_KEYS)
+    if unknown:
+        raise ValueError(f"{manifest_path}: unsupported '{field}' keys: {', '.join(unknown)}")
+    across = raw.get("across_sessions")
+    if not isinstance(across, bool):
+        raise TypeError(f"{manifest_path}: '{field}.across_sessions' must be a boolean")
+    param = raw.get("max_sessions_param")
+    if not across:
+        if param is not None:
+            raise ValueError(f"{manifest_path}: '{field}.max_sessions_param' is set, and across_sessions is false")
+        return
+    if not isinstance(param, str) or not param.strip():
+        raise TypeError(f"{manifest_path}: '{field}.max_sessions_param' must name the param that bounds a hold in sessions")
+    value = params.get(param)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{manifest_path}: '{field}.max_sessions_param' names '{param}', which must be a manifest "
+                         f"param holding a whole number >= 1, got {value!r}")
+    if not (isinstance(restore, dict) and restore.get("require_hybrid_metadata") is True):
+        raise ValueError(f"{manifest_path}: '{field}.across_sessions' needs "
+                         "'capabilities.startup_restore.require_hybrid_metadata': true")
+
+
+def _coerce_capabilities(raw: object, *, manifest_path: Path, params: Mapping[str, object]) -> dict[str, object]:
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -297,6 +338,9 @@ def _coerce_capabilities(raw: object, *, manifest_path: Path) -> dict[str, objec
         hybrid = restore.get("require_hybrid_metadata")
         if hybrid is not None and not isinstance(hybrid, bool):
             raise TypeError(f"{manifest_path}: 'capabilities.startup_restore.require_hybrid_metadata' must be a boolean")
+    holding = out.get("holding")
+    if holding is not None:
+        _validate_holding_capability(holding, restore=restore, params=params, manifest_path=manifest_path)
     shared_entry = out.get("shared_entry")
     if shared_entry is not None:
         _validate_shared_entry_capability(shared_entry, manifest_path=manifest_path)
@@ -438,7 +482,7 @@ def _load_manifest(manifest_path: Path) -> StrategyManifest:
     params = raw.get("params") or {}
     if not isinstance(params, dict):
         raise TypeError(f"{manifest_path}: 'params' must be a JSON object")
-    capabilities = _coerce_capabilities(raw.get("capabilities"), manifest_path=manifest_path)
+    capabilities = _coerce_capabilities(raw.get("capabilities"), manifest_path=manifest_path, params=params)
 
     return StrategyManifest(
         name=name,
@@ -502,3 +546,21 @@ def is_option_strategy(name: str | None) -> bool:
     if name is None:
         return False
     return plugin_key(name) in option_strategy_names()
+
+
+def holds_across_sessions(name: str | None) -> bool:
+    """Whether the strategy's manifest declares that it carries positions
+    across sessions (``capabilities.holding.across_sessions``)."""
+    if name is None:
+        return False
+    holding = get_plugin(str(name)).capabilities.get("holding")
+    return isinstance(holding, dict) and holding.get("across_sessions") is True
+
+
+def max_hold_sessions_param(name: str | None) -> str | None:
+    """The param that bounds a hold in sessions for a strategy that holds
+    across sessions (``capabilities.holding.max_sessions_param``); None for
+    every other strategy."""
+    if not holds_across_sessions(name):
+        return None
+    return str(get_plugin(str(name)).capabilities["holding"]["max_sessions_param"])

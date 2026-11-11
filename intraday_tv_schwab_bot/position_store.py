@@ -25,8 +25,14 @@ SQLITE_BUSY_SECONDS = 5.0
 
 
 class ReconcileMetadataStore:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, dry_run: bool = False):
         self.path = Path(path).expanduser()
+        # Whether the rows this store writes are a dry run's paper positions
+        # (the engine passes ``schwab.dry_run``): stamped on each row, so a
+        # dry-run restart can restore its own rows and never a live run's
+        # (``load_paper_rows``, 2026-11-10). False unless said: a row is
+        # paper only when its writer says so.
+        self.dry_run = bool(dry_run)
         self._initialized = False
         # The last write through save_if_changed: its rows' signature and
         # whether it replaced every row.
@@ -54,7 +60,8 @@ class ReconcileMetadataStore:
                     pair_id TEXT,
                     reference_symbol TEXT,
                     metadata_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    dry_run INTEGER
                 )
                 """
             )
@@ -80,6 +87,26 @@ class ReconcileMetadataStore:
             return
         self._ensure_schema()
         self._initialized = True
+
+    @staticmethod
+    def _has_dry_run_column(conn: sqlite3.Connection) -> bool:
+        return any(str(row[1]) == "dry_run" for row in conn.execute("PRAGMA table_info(open_position_metadata)"))
+
+    def _ensure_dry_run_column(self, conn: sqlite3.Connection) -> None:
+        """A file written before 2026-11-10 has no ``dry_run`` column: it
+        is added by the first WRITE, never by a read, so a file that can
+        be read but not written (read-only, or locked by another process)
+        still reads as it did; a row of such a file reads as no dry run's
+        (``load_paper_rows``). Checked at each write (one PRAGMA). Another
+        process adding the column at the same moment makes this ALTER fail:
+        the column is then there."""
+        if self._has_dry_run_column(conn):
+            return
+        try:
+            conn.execute("ALTER TABLE open_position_metadata ADD COLUMN dry_run INTEGER")
+        except sqlite3.OperationalError:
+            if not self._has_dry_run_column(conn):
+                raise
 
     @staticmethod
     def _serialize(position_key: str, position: Position) -> dict[str, Any]:
@@ -173,9 +200,11 @@ class ReconcileMetadataStore:
 
     def _write(self, positions: dict[str, Position], *, replace_all: bool) -> None:
         self._ensure_ready()
-        rows = [self._serialize(key, pos) for key, pos in positions.items()]
+        paper = 1 if self.dry_run else 0
+        rows = [{**self._serialize(key, pos), "dry_run": paper} for key, pos in positions.items()]
         conn = sqlite3.connect(self.path)
         try:
+            self._ensure_dry_run_column(conn)
             if replace_all:
                 conn.execute("DELETE FROM open_position_metadata")
             if rows:
@@ -184,11 +213,11 @@ class ReconcileMetadataStore:
                     INSERT OR REPLACE INTO open_position_metadata (
                         position_key, symbol, strategy, side, qty, entry_price, entry_time,
                         stop_price, target_price, trail_pct, highest_price, lowest_price,
-                        pair_id, reference_symbol, metadata_json, updated_at
+                        pair_id, reference_symbol, metadata_json, updated_at, dry_run
                     ) VALUES (
                         :position_key, :symbol, :strategy, :side, :qty, :entry_price, :entry_time,
                         :stop_price, :target_price, :trail_pct, :highest_price, :lowest_price,
-                        :pair_id, :reference_symbol, :metadata_json, :updated_at
+                        :pair_id, :reference_symbol, :metadata_json, :updated_at, :dry_run
                     )
                     """,
                     rows,
@@ -259,6 +288,39 @@ class ReconcileMetadataStore:
                 if not key:
                     continue
                 out[key] = self._deserialize(record)
+            except Exception as exc:
+                LOG.warning("Skipping startup reconcile metadata row due to parse error (%s: %s)",
+                            type(exc).__name__, exc)
+        return out
+
+    def load_paper_rows(self) -> list[dict[str, Any]]:
+        """Every saved row with where it came from, for the restore of paper
+        positions at a dry-run restart
+        (``StartupReconciler.restore_paper_positions``, 2026-11-10): ``key``,
+        ``position``, ``paper`` (True only for a row a dry run wrote: a live
+        run's row, and one saved before the column existed, is False) and
+        ``updated_at`` (the row's last save, as stored). In key order. A
+        missing file has no rows. A store that cannot be read raises, as
+        ``load_positions`` does: it is never read as empty. A row that does
+        not parse is skipped with its error's type."""
+        if not self.path.exists():
+            return []
+        self._ensure_ready()
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM open_position_metadata ORDER BY position_key").fetchall()
+        finally:
+            conn.close()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                record = dict(row)
+                key = str(record.get("position_key") or record.get("symbol") or "").strip()
+                if not key:
+                    continue
+                out.append({"key": key, "position": self._deserialize(record), "paper": record.get("dry_run") == 1,
+                            "updated_at": str(record.get("updated_at") or "")})
             except Exception as exc:
                 LOG.warning("Skipping startup reconcile metadata row due to parse error (%s: %s)",
                             type(exc).__name__, exc)

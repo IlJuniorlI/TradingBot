@@ -398,6 +398,11 @@ class BaseStrategy(ContextBuildersMixin):
     def requires_hybrid_startup_restore_metadata(self) -> bool:
         return bool(self._capability("startup_restore.require_hybrid_metadata", False))
 
+    def holds_across_sessions(self) -> bool:
+        """Whether this strategy carries positions across sessions (its
+        manifest's ``capabilities.holding.across_sessions``)."""
+        return self._capability("holding.across_sessions", False) is True
+
     def dashboard_candidate_limit(self, default_limit: int) -> int:
         mode = str(self._capability("dashboard.candidate_limit_mode", "default") or "default").strip().lower()
         if mode == "tradable_count":
