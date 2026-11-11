@@ -1253,6 +1253,10 @@ class IntradayBot:
                 "Session-boundary reconcile: new ET trading day %s (last=%s) — syncing broker positions/orders",
                 today, self._last_reconcile_session_date,
             )
+        # A sweep a closed position still owes goes first: the reconcile
+        # would read its leftover as a foreign order and block the day's
+        # entries, and the sweep would then cancel it a moment later.
+        self.position_manager.run_owed_sweeps(now, paced=False)
         self._reconcile_broker(today)
 
     def _reconcile_broker(self, session_date: date) -> None:
@@ -2117,6 +2121,11 @@ class IntradayBot:
                 self.entry_gatekeeper.settle_unsettled_entry_orders()
                 timer.facts["positions"] = len(self.positions)
                 self.position_manager.manage_positions(now, bars)
+            else:
+                # A closed position's exit orders still to sweep are not
+                # left to the next management window when the strategy's
+                # stop outlives the day (PositionManager.run_owed_sweeps).
+                self.position_manager.run_owed_sweeps(now, paced=True)
             timer.enter("htf_refresh")
             self._refresh_htf_frames(gate_state, htf_cycle, where="before entries", bars=bars)
             timer.enter("entries")

@@ -137,7 +137,8 @@ def extract_orders(payload: Any) -> list[dict[str, Any]]:
     ``filledQuantity`` and ``fillPrice`` (None where the order does not
     carry it as a finite number), ``fillPriceEstimated`` (True when
     ``fillPrice`` is not an execution price: ``order_fill_price_estimated``),
-    and ``replacementId``, the order that
+    ``filledAt`` (when it last executed, None when that does not read:
+    ``order_filled_at``), and ``replacementId``, the order that
     REPLACED it (``order_replacement_id``). The disaster stop's
     unknown-outcome lookup reads every status, since the stop a lost
     response placed may have filled, died or been replaced since
@@ -178,6 +179,7 @@ def extract_orders(payload: Any) -> list[dict[str, Any]]:
             "filledQuantity": order_filled_qty(row),
             "fillPrice": order_fill_price(row),
             "fillPriceEstimated": order_fill_price_estimated(row),
+            "filledAt": order_filled_at(row),
             "replacementId": order_replacement_id(row),
         })
     return out
@@ -190,15 +192,54 @@ def extract_working_orders(payload: Any) -> list[dict[str, Any]]:
     return [row for row in extract_orders(payload) if order_may_be_live(row["status"])]
 
 
-def order_entered_at(order: dict[str, Any]) -> datetime | None:
-    """When the broker entered *order* (an ``extract_orders`` row's
-    ``enteredTime``, as Schwab writes it: ``2026-09-22T14:00:00+0000``), or
-    None when it is missing, unreadable or carries no UTC offset."""
+def _broker_time(value: Any) -> datetime | None:
+    """A broker timestamp (as Schwab writes one:
+    ``2026-09-22T14:00:00+0000``), or None when it is missing, unreadable
+    or carries no UTC offset."""
     try:
-        entered = datetime.fromisoformat(str(order.get("enteredTime") or ""))
+        stamp = datetime.fromisoformat(str(value or ""))
     except ValueError:
         return None
-    return entered if entered.utcoffset() is not None else None
+    return stamp if stamp.utcoffset() is not None else None
+
+
+def order_entered_at(order: dict[str, Any]) -> datetime | None:
+    """When the broker entered *order* (an ``extract_orders`` row's
+    ``enteredTime``), or None when it does not read (``_broker_time``)."""
+    return _broker_time(order.get("enteredTime"))
+
+
+def order_filled_at(payload: dict[str, Any] | None) -> datetime | None:
+    """When the order last executed: the newest ``time`` of its executions
+    (``orderActivityCollection[].executionLegs[].time``) when every one of
+    them carries a time that reads; else, for an order that reads FILLED,
+    its ``closeTime`` (when it completed: its last fill). None when neither
+    reads (``_broker_time``): a caller must treat that as a time it does
+    not know, never as now.
+
+    One execution without a time leaves the newest unknown (it may be that
+    one), so the times that do read are not used. An order in any status
+    but FILLED carries no ``closeTime`` worth reading as a fill's: one
+    cancelled after a partial fill closed when it was cancelled.
+
+    The field names are Schwab's order schema's; neither has been read off
+    a live fill (unverified, 2026-11-10)."""
+    if not isinstance(payload, dict):
+        return None
+    times: list[datetime] = []
+    untimed = False
+    for activity in payload.get("orderActivityCollection") or []:
+        if not isinstance(activity, dict):
+            continue
+        for leg in activity.get("executionLegs") or []:
+            stamp = _broker_time(leg.get("time")) if isinstance(leg, dict) else None
+            if stamp is None:
+                untimed = True
+            else:
+                times.append(stamp)
+    if times and not untimed:
+        return max(times)
+    return _broker_time(payload.get("closeTime")) if order_status(payload) == "FILLED" else None
 
 
 def order_status(payload: dict[str, Any] | None) -> str:
@@ -425,6 +466,9 @@ def flatten_order_tree(node: Any, out: dict[str, dict[str, Any]]) -> None:
             # True when fill_price is not an execution price
             # (order_fill_price_estimated): the order's own, or none.
             "fill_price_estimated": order_fill_price_estimated(node),
+            # When it last executed; None when the payload gives no time
+            # that reads (order_filled_at).
+            "filled_at": order_filled_at(node),
             "is_filled": order_is_filled(node),
             "is_terminal_failure": order_is_terminal_failure(node),
             # The order that REPLACED it, when the payload names one.

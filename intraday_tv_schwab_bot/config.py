@@ -33,6 +33,7 @@ from ._strategies.catalogue import (
     get_plugins,
     holds_across_sessions,
     is_option_strategy,
+    max_hold_sessions_param,
     normalize_strategy_name,
     plugin_names,
 )
@@ -2478,6 +2479,129 @@ def _validate_disaster_stop_restart(execution: EquityExecutionConfig, schwab: Sc
     _raise_section_errors("execution", errors, config_path)
 
 
+# The longest span of orders the broker lists in one read: schwabdev documents
+# ``account_orders``' date range as a year at most (not checked at the API).
+ORDER_LISTING_MAX_DAYS = 365
+
+
+def cross_session_order_lookback_days(max_hold_sessions: int) -> int:
+    """The fewest days of orders (``runtime.startup_order_lookback_days``)
+    a live strategy that holds a position for up to *max_hold_sessions*
+    sessions must read back: one and a half calendar days a session (ten
+    sessions span fourteen calendar days, and a holiday adds one), and five
+    more for an exit that slips a few sessions. 20 for ten sessions. In
+    whole numbers (ceil(1.5 x n) is (3n + 1) // 2): a count too large for a
+    float still answers."""
+    return (3 * int(max_hold_sessions) + 1) // 2 + 5
+
+
+def _validate_cross_session_hold(strategy: str, params: Mapping[str, Any], execution: EquityExecutionConfig,
+                                 schwab: SchwabConfig, runtime: RuntimeConfig, config_path: Path) -> None:
+    """A live strategy that holds positions across sessions (its manifest's
+    ``capabilities.holding``) needs a restart that brings each position
+    back as it was saved, a stop that outlives the day, and order reads
+    that reach back over the whole hold. Refused when ``schwab.dry_run`` is
+    false unless:
+
+    - ``runtime.reconcile_on_startup`` is on with ``startup_reconcile_mode:
+      restore_hybrid``, the one mode that restores a position with its
+      entry time (the hold is counted from it), its stop and its stop's
+      order id. Such a strategy restores a position only from its saved
+      row (the catalogue requires
+      ``startup_restore.require_hybrid_metadata`` with the capability),
+      and ``restore_basic`` reads none, so it restores nothing, as
+      ``ignore`` and ``log_only`` do; ``block`` counts the bot's own
+      carried position and resting stop every new day.
+    - ``runtime.session_reconcile_on_resume`` is on: with the bot up, the
+      reconcile at each new trading day is what settles a carried position
+      closed in the app overnight. Without it the manager re-places the
+      cancelled stop for shares no longer held, and the strategy's exit
+      sells them short.
+    - ``execution.disaster_stop_enabled`` is on: the good-till-cancelled
+      disaster stop (``SchwabExecutor.disaster_stop_duration``) is what
+      protects the position at the open and on a day the bot is down. A
+      bracket's stop is a DAY order.
+    - ``execution.extended_hours_enabled`` is off: an engine exit cancels
+      the resting stop first, and outside the regular session no STOP can
+      be placed again, so an exit that does not fill there leaves the
+      position with no broker stop until the next 09:30 pass.
+    - ``runtime.startup_order_lookback_days`` is at least
+      ``cross_session_order_lookback_days`` of the hold's bound (the param
+      the manifest names, ``capabilities.holding.max_sessions_param``) and
+      at most ``ORDER_LISTING_MAX_DAYS``: the reads that look for a stop
+      moved in the app (the restart's snapshot,
+      ``SchwabExecutor.resting_stop_orders``) go back that far, and one
+      moved before it would be missed and stacked on. A hold whose floor
+      is past what the broker lists is refused.
+
+    Every rule broken is named in the one error. It runs ahead of
+    ``_validate_disaster_stop_restart``, whose remedies (``block``,
+    ``restore_basic``, the disaster stop off) it refuses for such a
+    strategy. A dry run places nothing and restores its paper positions on
+    its own (``StartupReconciler.restore_paper_positions``): not checked."""
+    if not holds_across_sessions(strategy) or schwab.dry_run is not False:
+        return
+    held = f"the active strategy {strategy!r} holds positions across sessions"
+    live = "so with schwab.dry_run false"
+    errors: list[str] = []
+    if runtime.reconcile_on_startup is not True or runtime.startup_reconcile_mode != "restore_hybrid":
+        errors.append(
+            f"{held}, {live} it needs runtime.reconcile_on_startup: true and "
+            f"runtime.startup_reconcile_mode: restore_hybrid (got reconcile_on_startup: "
+            f"{runtime.reconcile_on_startup!r}, startup_reconcile_mode: {runtime.startup_reconcile_mode!r}): only "
+            "that mode restores a carried position with its entry time, its stop and its stop order"
+        )
+    if runtime.session_reconcile_on_resume is not True:
+        errors.append(
+            f"{held}, {live} it needs runtime.session_reconcile_on_resume: true: with the bot up, the reconcile "
+            "at each new trading day is what settles a carried position closed in the app overnight"
+        )
+    if execution.disaster_stop_enabled is not True:
+        errors.append(
+            f"{held}, {live} it needs execution.disaster_stop_enabled: true (and so "
+            "execution.bracket_orders_enabled: false): the good-till-cancelled disaster stop is its only protection "
+            "at the open and on a day the bot is down"
+        )
+    if execution.extended_hours_enabled is not False:
+        errors.append(
+            f"{held}, {live} it needs execution.extended_hours_enabled: false: an exit outside the regular "
+            "session cancels the resting stop first, and no STOP can be placed again before 09:30"
+        )
+    bound = max_hold_sessions_param(strategy)
+    sessions_held = params.get(bound)
+    # A whole number >= 1, as an int or a float that is one (10.0); an int
+    # is never passed to math.isfinite, which raises on one too large.
+    whole = (not isinstance(sessions_held, bool) and isinstance(sessions_held, (int, float))
+             and (isinstance(sessions_held, int) or (math.isfinite(sessions_held) and sessions_held.is_integer()))
+             and sessions_held >= 1)
+    lookback = runtime.startup_order_lookback_days
+    if not whole:
+        errors.append(
+            f"{held} for at most strategies.{strategy}.params.{bound} sessions, which must be a whole number "
+            f">= 1, got {sessions_held!r}"
+        )
+    else:
+        needed = cross_session_order_lookback_days(int(sessions_held))
+        hold = f"{held} for up to {int(sessions_held)} sessions (strategies.{strategy}.params.{bound})"
+        if needed > ORDER_LISTING_MAX_DAYS:
+            errors.append(
+                f"{hold}, which needs {needed} days of orders read back (ceil(1.5 x the sessions) + 5), more than "
+                f"the {ORDER_LISTING_MAX_DAYS} the broker lists: shorten the hold"
+            )
+        elif lookback < needed:
+            errors.append(
+                f"{hold}, {live} runtime.startup_order_lookback_days must be at least {needed} "
+                f"(ceil(1.5 x {int(sessions_held)}) + 5), got {lookback}: a stop moved in the app before the order "
+                "lookback would not be found, and a second one placed beside it"
+            )
+    if lookback > ORDER_LISTING_MAX_DAYS:
+        errors.append(
+            f"{held}, {live} runtime.startup_order_lookback_days must be at most {ORDER_LISTING_MAX_DAYS} (the "
+            f"broker lists a year of orders at most), got {lookback}"
+        )
+    _raise_section_errors("cross-session hold", errors, config_path)
+
+
 def _validate_shared_exit_config(shared_exit: SharedExitLogicConfig, risk: RiskConfig, config_path: Path) -> None:
     """The shared exit switches, and the adaptive ladder touch hold's
     timeout (``_NUMBER_CHECKS["shared_exit"]``). ``SharedExitPolicy`` reads
@@ -3008,6 +3132,8 @@ def load_config(path: str | Path, strategy_override: str | None = None, env_path
 
     execution_cfg = EquityExecutionConfig(**execution_raw)
     _validate_execution_config(execution_cfg, risk_cfg, shared_exit_cfg, strategy, config_path)
+    _validate_cross_session_hold(strategy, strategies[strategy].params, execution_cfg, schwab_cfg, runtime_cfg,
+                                 config_path)
     _validate_disaster_stop_restart(execution_cfg, schwab_cfg, runtime_cfg, config_path)
 
     options_cfg = ZeroDteOptionsConfig(**options_raw)

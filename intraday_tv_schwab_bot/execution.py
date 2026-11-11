@@ -932,6 +932,17 @@ class SchwabExecutor:
         an option strategy at load)."""
         return bool(self.config.execution.disaster_stop_enabled)
 
+    def disaster_stop_duration(self) -> str:
+        """The lifetime a disaster stop is sent with. Good-till-cancelled
+        for a strategy that holds across sessions
+        (``BotConfig.active_holds_across_sessions``, its manifest's
+        ``capabilities.holding``): a DAY stop EXPIRES at each close, so the
+        position opened the next session with no stop until the bot's first
+        pass placed one, and had none all day when the bot was down. DAY for
+        every other strategy, which is flat by the close. The session is
+        NORMAL either way: no STOP triggers outside the regular session."""
+        return "GOOD_TILL_CANCEL" if self.config.active_holds_across_sessions else "DAY"
+
     def disaster_stop_price(self, side: Side, entry_price: float, initial_stop: float) -> float:
         """Where a position's disaster stop rests: ``disaster_stop_r`` times
         its initial R beyond its initial stop, or ``disaster_stop_min_pct``
@@ -1041,13 +1052,18 @@ class SchwabExecutor:
         return self._round_equity_price(float(stop_price) + offset, "up")
 
     def _bracket_stop_child(self, symbol: str, qty: int, exit_intent: OrderIntent, stop_price: float,
-                            stop_limit_price: float | None, session: str, *, order_type: str) -> dict[str, Any]:
+                            stop_limit_price: float | None, session: str, *, order_type: str,
+                            duration: str) -> dict[str, Any]:
         """A protective stop order: ``order_type`` is a bracket's
-        ``bracket_stop_order_type``, or ``STOP`` for a disaster stop."""
+        ``bracket_stop_order_type``, or ``STOP`` for a disaster stop;
+        ``duration`` is ``DAY`` for a bracket's stop, and
+        ``disaster_stop_duration`` for a disaster stop. Every caller names
+        it: a default would send a stop meant to outlive the session as a
+        DAY order."""
         child: dict[str, Any] = {
             "orderStrategyType": "SINGLE",
             "session": session,
-            "duration": "DAY",
+            "duration": duration,
             "orderType": order_type,
             "stopPrice": f"{stop_price:.4f}",
             "orderLegCollection": [self._equity_order_leg(symbol, qty, exit_intent)],
@@ -1084,7 +1100,8 @@ class SchwabExecutor:
         rounded_stop = self._round_equity_price(stop_price, direction)
         stop_limit = self.bracket_stop_limit_price(side, rounded_stop, initial_risk=initial_risk)
         children = [self._bracket_stop_child(symbol, qty, exit_intent, rounded_stop, stop_limit, session,
-                                             order_type=self.config.execution.bracket_stop_order_type)]
+                                             order_type=self.config.execution.bracket_stop_order_type,
+                                             duration="DAY")]
         rounded_target: float | None = None
         if self.bracket_carries_target() and target_price is not None:
             rounded_target = self._round_equity_price(target_price, direction)
@@ -1203,6 +1220,32 @@ class SchwabExecutor:
               for stamp in (start, now)),
         )
 
+    def resting_stop_orders(self) -> list[dict[str, Any]] | None:
+        """The account's orders among which an exit stop no record tracks
+        may still rest for one of the strategy's positions, or None when
+        they could not be read. The day's (``todays_orders``) for a
+        strategy that is flat by the close: its stops are DAY orders. For a
+        strategy that holds across sessions
+        (``BotConfig.active_holds_across_sessions``) the orders entered
+        over ``runtime.startup_order_lookback_days``, as the restart's own
+        read goes back: its disaster stop is good-till-cancelled
+        (``disaster_stop_duration``), so one moved in the app on an earlier
+        day (REPLACED under a new id) still rests. Read from midnight, that
+        replacement is not listed: a second stop would be placed beside it,
+        and the sweep after a close would leave it working. A live config
+        for such a strategy must set a lookback that covers its longest
+        hold (``config._validate_cross_session_hold``).
+
+        Read before a disaster stop is placed (``ensure_position_protected``)
+        and by the sweep after a close (``PositionManager._run_exit_sweep``).
+        The followers of a REPLACED entry or exit order keep the day's read:
+        those are DAY orders, and over a longer read an earlier day's dead
+        record could take a later order for its replacement."""
+        if not self.config.active_holds_across_sessions:
+            return self.todays_orders()
+        lookback = datetime.timedelta(days=int(self.config.runtime.startup_order_lookback_days))
+        return self.todays_orders(sessions.now_et() - lookback)
+
     def order_state(self, order_id: str) -> dict[str, Any] | None:
         """One order's state row (the ``fetch_order_states`` shape) via
         ``order_details``, for an order the account_orders listing did not
@@ -1297,12 +1340,14 @@ class SchwabExecutor:
         session, never a target, adopted, resized and mirrored in a dry run as
         a bracket's stop is, and placed by ``_place_disaster_stop``; neither
         ``initial_risk`` nor ``parent_order_id`` (a bracketed entry's) is read
-        for it. Before one is placed in the regular session the day's orders
-        are read: an exit stop no record tracks that may still work on the
-        symbol for the side (``resting_exit_stop``: one moved in the app, or
-        placed there, in any status but a terminal one) is adopted and
-        resized instead, and logged; orders that cannot be read place nothing
-        (``unprotected``, retried) (2026-09-29).
+        for it. Before one is placed in the regular session the orders that
+        may still work are read (``resting_stop_orders``: the day's, or the
+        order lookback's for a strategy that holds across sessions, whose
+        stop is good-till-cancelled): an exit stop no record tracks that may
+        still work on the symbol for the side (``resting_exit_stop``: one
+        moved in the app, or placed there, in any status but a terminal one)
+        is adopted and resized instead, and logged; orders that cannot be
+        read place nothing (``unprotected``, retried) (2026-09-29).
 
         Returns the bracket state dict, or None when neither brackets nor the
         disaster stop are on.
@@ -1357,7 +1402,7 @@ class SchwabExecutor:
             # same shares twice, so it is adopted instead (2026-09-29).
             # Outside the regular session nothing is placed, so nothing is
             # read either.
-            orders = self.todays_orders()
+            orders = self.resting_stop_orders()
             if orders is None:
                 LOG.error(
                     "Disaster stop for %s qty=%s: the day's orders could not be read to look for a stop already "
@@ -1409,8 +1454,10 @@ class SchwabExecutor:
     def _place_disaster_stop(self, symbol: str, qty: int, side: Side, base: dict[str, Any]) -> dict[str, Any]:
         """Submit a position's disaster stop: one plain STOP (never a
         STOP_LIMIT, which a flush can leave unfilled) for the regular
-        session, DAY, at ``base["stop_price"]``. The record it returns is
-        ``active`` only once the broker returned the new order's id.
+        session, at ``base["stop_price"]``, DAY or, for a strategy that
+        holds across sessions, good-till-cancelled
+        (``disaster_stop_duration``). The record it returns is ``active``
+        only once the broker returned the new order's id.
 
         - Outside the regular session nothing is sent (Schwab rejects a STOP
           there): ``pending_session``, placed by the first regular-session
@@ -1442,7 +1489,7 @@ class SchwabExecutor:
         attempted_at = sessions.now_et().isoformat()
         stop_price = float(base["stop_price"])
         spec = self._bracket_stop_child(symbol, qty, self.order_intent_for_exit(side), stop_price, None, "NORMAL",
-                                        order_type="STOP")
+                                        order_type="STOP", duration=self.disaster_stop_duration())
         try:
             response = self._submit_live_order_spec(spec)
         except SCHWAB_WRITE_UNKNOWN_OUTCOME as exc:
@@ -1613,7 +1660,8 @@ class SchwabExecutor:
     def resize_bracket_children(self, bracket: dict[str, Any], symbol: str, side: Side, qty: int,
                                 session: str, *, initial_risk: float | None) -> tuple[bool, str]:
         """Re-issue the resting protective children at a new share count, at
-        the levels they rest at (a disaster stop as the plain STOP it is).
+        the levels they rest at (a disaster stop as the plain STOP it is,
+        with its own lifetime: ``disaster_stop_duration``).
 
         The short-flip guard: children are submitted for the REQUESTED entry
         quantity, so a partial entry fill leaves an oversized resting exit that
@@ -1628,11 +1676,13 @@ class SchwabExecutor:
         ok = True
         if bracket.get("stop_order_id") and stop_price > 0:
             if is_disaster_stop(bracket):
-                spec = self._bracket_stop_child(symbol, qty, exit_intent, stop_price, None, session, order_type="STOP")
+                spec = self._bracket_stop_child(symbol, qty, exit_intent, stop_price, None, session,
+                                                order_type="STOP", duration=self.disaster_stop_duration())
             else:
                 stop_limit = self.bracket_stop_limit_price(side, stop_price, initial_risk=initial_risk)
                 spec = self._bracket_stop_child(symbol, qty, exit_intent, stop_price, stop_limit, session,
-                                                order_type=self.config.execution.bracket_stop_order_type)
+                                                order_type=self.config.execution.bracket_stop_order_type,
+                                                duration="DAY")
             child_ok, msg = self.replace_bracket_child(bracket, "stop_order_id", spec)
             ok = ok and child_ok
             messages.append(f"stop:{msg}")
@@ -1673,7 +1723,8 @@ class SchwabExecutor:
             if resting_stop is None or abs(rounded - float(resting_stop)) >= min_delta:
                 stop_limit = self.bracket_stop_limit_price(side, rounded, initial_risk=initial_risk)
                 spec = self._bracket_stop_child(symbol, int(qty), exit_intent, rounded, stop_limit, session,
-                                                order_type=self.config.execution.bracket_stop_order_type)
+                                                order_type=self.config.execution.bracket_stop_order_type,
+                                                duration="DAY")
                 ok, msg = self.replace_bracket_child(bracket, "stop_order_id", spec)
                 if ok:
                     bracket["stop_price"] = rounded

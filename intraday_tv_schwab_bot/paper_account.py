@@ -931,10 +931,30 @@ class PaperAccount:
         remaining_qty_after_exit: int = 0,
         fill_price_estimated: bool = False,
         broker_recovered: bool = False,
+        exit_time: datetime | None = None,
     ) -> float:
+        """Book an exit slice of *position* at *fill_price*; returns its
+        realized P&L.
+
+        *exit_time* is when it filled, for a fill the broker made at a time
+        that is not now (a stop that filled on an earlier day while the bot
+        was down, booked by the restart's reconcile, 2026-11-10); None, as
+        every other caller passes, stamps now. The trade carries it as its
+        exit time and its hold is counted to it. A time on a day before
+        the day ledger's books into no day's figures (``_day_for``): the
+        trade is in the run's realized P&L, its statistics and the
+        trades.csv outbox, dated by its exit. One on the ledger's own day,
+        or on a trading day it has not reached yet, books into that day as
+        an exit made then would have. A time that carries no UTC offset,
+        or lies after now, raises ValueError: a day that has not come
+        would roll the day ledger to it."""
         fill_price = float(fill_price)
         with self._lock:
-            exit_ts = sessions.now_et()
+            booked_at = sessions.now_et()
+            if exit_time is not None and (exit_time.utcoffset() is None or exit_time > booked_at):
+                raise ValueError(f"exit_time {exit_time!r} for {position.symbol} carries no UTC offset or lies "
+                                 f"after now ({booked_at.isoformat()})")
+            exit_ts = booked_at if exit_time is None else exit_time.astimezone(booked_at.tzinfo)
             # Before the exit moves the equity: a new trading day opens at
             # the last sample.
             ledger = self._day_for(exit_ts)
@@ -1034,7 +1054,7 @@ class PaperAccount:
             )
             save = bool(self._day_unsaved)
         if save:
-            self._save_days(exit_ts)
+            self._save_days(booked_at)
         return realized
 
     def _release(self, position: Position, fill_price: float, *, final_exit: bool) -> float:

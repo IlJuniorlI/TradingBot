@@ -115,8 +115,11 @@ LOG = logging.getLogger("intraday_tv_schwab_bot.engine")
 # How often a bracket child the account_orders listing does not return is read
 # on its own with order_details. The listing looks back 8 hours, and a child
 # placed outside an order session (a restore before 07:00, a re-protect the
-# evening before) is a NORMAL DAY order that can outlive it. One read a minute
-# per such child keeps a few of them far inside Schwab's ~120 requests/minute.
+# evening before) is a NORMAL DAY order that can outlive it; so does the
+# good-till-cancelled disaster stop of a strategy that holds across sessions
+# (SchwabExecutor.disaster_stop_duration) from its second session on. One read
+# a minute per such child keeps a few of them far inside Schwab's ~120
+# requests/minute.
 UNLISTED_BRACKET_CHILD_READ_SECONDS = 60.0
 
 # How long after an attempt at a position's disaster stop that did not leave
@@ -130,6 +133,13 @@ UNLISTED_BRACKET_CHILD_READ_SECONDS = 60.0
 # this long before the attempt on, so a clock a little off the broker's
 # still finds it.
 DISASTER_STOP_RETRY_SECONDS = 60.0
+
+# How often a post-close sweep still owed is tried again on the passes that
+# manage no position (PositionManager.run_owed_sweeps). The leftover it is
+# after cannot fill outside the regular session, and such a pass comes every
+# loop sleep while a position is held: one try a minute keeps a broker that
+# cannot be read from an order read and an ERROR every two seconds all evening.
+OWED_SWEEP_RETRY_SECONDS = 60.0
 
 # The price the paper account marks a held equity at, which the session
 # archive's manifest and the SESSION REPORT name (``equity_mark_basis``): the
@@ -226,6 +236,8 @@ class PositionManager:
         # position whose orders could not be read, or whose leftover exit
         # orders' cancel is not confirmed; see _sweep_exit_orders.
         self._sweeps_owed: dict[str, dict[str, Any]] = {}
+        # When run_owed_sweeps last tried them (monotonic), None before.
+        self._owed_sweeps_tried_at: float | None = None
         # Position key -> its recent spreads, the abnormal-book guard of a
         # strategy that judges its protective exits on the executable side;
         # see _protective_read.
@@ -947,8 +959,10 @@ class PositionManager:
         A child the 8-hour listing does not return is read on its own
         (``_unlisted_bracket_child_state``): a stop placed before 07:00 that
         filled after 15:00 was never booked. A stop that died at the broker
-        without filling -- a DAY order EXPIRED at its session's end, one
-        CANCELED in the app, a REJECTED one -- retires its bracket
+        without filling -- a DAY order EXPIRED at its session's end (a
+        good-till-cancelled disaster stop, a strategy's that holds across
+        sessions, does not), one CANCELED in the app, a REJECTED one --
+        retires its bracket
         (``_retire_dead_bracket``): until then the bracket still read active,
         so RiskManager deferred the stop to an order that no longer rested
         and nothing protected the position (2026-09-25).
@@ -1799,6 +1813,38 @@ class PositionManager:
         and management keeps running the sweep."""
         return sorted({str(owed["symbol"]).upper().strip() for owed in self._sweeps_owed.values()})
 
+    def run_owed_sweeps(self, now: datetime, *, paced: bool) -> None:
+        """Try the post-close sweeps still owed (``_run_exit_sweep``) off a
+        management pass, while the broker takes orders (the stream window,
+        07:00-20:00 ET on a trading day), for a strategy that holds across
+        sessions; nothing otherwise (2026-11-10).
+
+        ``manage_positions`` tries an owed sweep at the start of each
+        management pass, and those end with the regular session. The
+        leftover such a strategy can owe is a good-till-cancelled stop: one
+        whose read or cancel failed in the session's last minutes rested
+        through the night and was live at 09:30:00, ahead of the first
+        management pass, against a position no longer held. A DAY leftover
+        died at the close, so every other strategy keeps the management
+        pass's retry alone.
+
+        The engine calls it on each pass that manages no position (*paced*:
+        one try every ``OWED_SWEEP_RETRY_SECONDS`` at most), and once ahead
+        of each broker reconcile (not paced): the reconcile of a new day
+        would otherwise read the leftover as a foreign order and block the
+        day's entries, minutes before the sweep cancelled it."""
+        if not (self._sweeps_owed and self.config.active_holds_across_sessions):
+            return
+        if not sessions.equity_session_state(
+                now, extended_hours_enabled=bool(self.config.execution.extended_hours_enabled)).stream_available:
+            return
+        tried_at = self._owed_sweeps_tried_at
+        if paced and tried_at is not None and time.monotonic() - tried_at < OWED_SWEEP_RETRY_SECONDS:
+            return
+        self._owed_sweeps_tried_at = time.monotonic()
+        for key in list(self._sweeps_owed):
+            self._run_exit_sweep(key)
+
     def _sweep_exit_orders(self, key: str, position: Position) -> None:
         """After a full close of a position that had live broker protection,
         cancel the exit orders that may still work on its symbol for its side
@@ -1811,7 +1857,10 @@ class PositionManager:
         whose submit had an unknown outcome and landed, if the position
         closed in full before the lookup found it; a replacement a replace
         left untracked (``new_id_unknown``); and a stop moved in the app.
-        One read of the day's orders per such close; a dry run and a
+        One read of the day's orders per such close
+        (``SchwabExecutor.resting_stop_orders``; of the whole order lookback
+        for a strategy that holds across sessions, whose good-till-cancelled
+        stop moved in the app on an earlier day still rests); a dry run and a
         position that had no broker protection (no record, or a simulated
         one) read nothing. The account's positions in a symbol the bot
         trades are taken as the bot's own, as the startup reconcile takes
@@ -1845,7 +1894,10 @@ class PositionManager:
     def _run_exit_sweep(self, key: str) -> None:
         """Run *key*'s owed post-close sweep (``_sweep_exit_orders``). One
         whose read fails, or whose leftover orders' cancel the broker does
-        not confirm, stays owed and is tried again next pass, logged at
+        not confirm, stays owed and is tried again next pass (a management
+        pass; for a strategy that holds across sessions also once a minute
+        on the other passes while the broker takes orders,
+        ``run_owed_sweeps``), logged at
         ERROR, and every ``execution.disaster_stop_escalation_attempts``-th
         consecutive failure logs ``EXIT ORDERS LEFT`` at CRITICAL; a
         leftover that sold shares before its cancel is CRITICAL at once. The
@@ -1869,7 +1921,7 @@ class PositionManager:
         ended, and rested none (2026-09-29)."""
         owed = self._sweeps_owed[key]
         symbol, side, sent = owed["symbol"], owed["side"], owed["sent"]
-        orders = self.executor.todays_orders()
+        orders = self.executor.resting_stop_orders()
         sent_orders: list[dict[str, Any]] | None = []
         if orders is not None and sent is not None:
             sent_orders = self.executor.todays_orders(sent["sent_at"] - timedelta(seconds=DISASTER_STOP_RETRY_SECONDS))

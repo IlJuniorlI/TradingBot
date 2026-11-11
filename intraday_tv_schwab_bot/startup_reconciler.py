@@ -53,13 +53,14 @@ import copy
 from dataclasses import replace
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
 
 from .broker_payloads import (
     DISASTER_SYNC_MODE,
     ORDER_REPLACED,
     active_broker_bracket,
+    booked_child_part,
     booked_fills_ledger,
     protective_stop_reason,
     bracket_order_ids,
@@ -72,6 +73,7 @@ from .broker_payloads import (
     order_status_class,
     resting_exit_stop,
     sent_exit_stop,
+    unbooked_fill_price,
     working_exit_outstanding_qty,
 )
 from .config import BotConfig
@@ -79,7 +81,8 @@ from .data_feed import MANAGEMENT_PRICE_KEYS, MarketDataStore
 from .models import (ASSET_TYPE_EQUITY, ASSET_TYPE_OPTION_SINGLE, ASSET_TYPE_OPTION_VERTICAL, Position, Side, asset_type_of,
                      is_option_asset)
 from .paper_account import PaperAccount
-from .numeric import first_float, safe_float
+from .numeric import first_float, safe_float, safe_int
+from .position_manager import DISASTER_STOP_RETRY_SECONDS
 from .position_metrics import initial_risk_per_unit
 from .position_store import ReconcileMetadataStore
 from .risk import RiskManager
@@ -151,6 +154,12 @@ class StartupReconciler:
         # while the bot was down was to be booked: the attempt fails so the
         # retry reads it (``_book_positions_closed_while_down``).
         self._close_booking_error: str | None = None
+        # The saved rows this process booked as closed while the bot was
+        # down: a row whose delete failed is not booked again by a retry.
+        self._closes_booked: set[str] = set()
+        # The symbols whose carried position no saved row matches any more,
+        # each named once at CRITICAL (``_restore_broker_positions``).
+        self._carried_unmatched_reported: set[str] = set()
         # State set by reconcile() and read by engine + entry gate.
         self.trading_blocked_reason: str | None = None
         self.trading_blocked_message: str | None = None
@@ -335,6 +344,54 @@ class StartupReconciler:
                 continue
             return str(key), position
         return None
+
+    def _carried_rows_left_unmatched(self, metadata_positions: dict[str, Position], symbol: str) -> list[str]:
+        """The saved rows of this strategy on *symbol*, each as text, for a
+        broker row the hybrid match took none of, in a live run of a
+        strategy that holds across sessions
+        (``BotConfig.active_holds_across_sessions``); empty otherwise.
+
+        Such a row is a carried position the account still holds in another
+        shape: its stop sold part of it while the bot was down (the
+        quantity gap the match refuses), or the holding changed at the
+        broker. The caller fails the attempt on it. Until 2026-11-10 the
+        broker row was skipped and the saved row pruned as stale, which
+        left the shares still held with nothing tracking them, and their
+        stop read as a foreign order to clear.
+
+        Left out of this rule, and so skipped and pruned as before: a row
+        whose last writer was a dry run
+        (``ReconcileMetadataStore.load_paper_rows``; named at WARNING), a
+        paper position the account's holding only shares a symbol with; and
+        every row of a strategy that is flat by the close, which this rule
+        leaves as it was. A dry run is not judged: its saved rows are paper
+        positions, and the broker's rows are not theirs.
+
+        The hybrid match itself still reads such a row: the mark says who
+        wrote the row last, not where the position came from, and a dry run
+        that restored a real holding from a live run's row re-marks it.
+        Left out of the match too, the next live start dropped that
+        holding. So a paper row the account matches exactly (side, size,
+        cost) is restored as this run's position; which of the two a live
+        start should trust is not settled here."""
+        if self.config.schwab.dry_run or not self.config.active_holds_across_sessions:
+            return []
+        symbol_upper = str(symbol).upper().strip()
+        rows = {
+            str(key): position for key, position in metadata_positions.items()
+            if str(position.symbol).upper().strip() == symbol_upper and position.strategy == self.config.strategy
+        }
+        if not rows:
+            return []
+        paper = {str(row["key"]) for row in self.reconcile_metadata_store.load_paper_rows() if row["paper"]}
+        if paper & set(rows):
+            LOG.warning("Saved row(s) %s on %s were written by a dry run: paper positions, not this live run's. They "
+                        "are left out of the restore and pruned", ", ".join(sorted(paper & set(rows))), symbol_upper)
+        return [
+            f"{key}: {position.side.value} {int(position.qty)} at {float(position.entry_price):.4f}, entered "
+            f"{position.entry_time.isoformat()}"
+            for key, position in rows.items() if key not in paper
+        ]
 
     def _reprotect_restored_position(self, position: Position, working_orders: list[dict[str, Any]]) -> None:
         """Make a restored position's bracket state truthful before it is managed.
@@ -591,24 +648,57 @@ class StartupReconciler:
         (``executor.order_state``): its quantity and price, the reason the
         running bot books that stop's fill with (``disaster_stop`` or
         ``broker_stop``, ``broker_payloads.protective_stop_reason``),
-        broker-recovered, into the account (trades.csv, the day's figures)
-        and ``risk.register_realized_pnl``, gain or loss, since the price is
-        an execution's. The entry is booked for the filled shares only; a
-        remainder the broker holds none of went some other way and is
-        logged at ERROR, unbooked. The row is deleted once booked: a save
-        before the first successful reconcile is an upsert that keeps it,
-        and a retry or a restart booked the fill again (the verifier's
-        probes); the row of a position this process closed itself goes at
-        the engine's next metadata save (``IntradayBot._save_reconcile_metadata``),
-        so a stop the manager booked is not booked here after a restart. A
-        stop that filled on an earlier day
-        (the position was entered before today; a DAY stop fills the day
-        it is entered) is that day's P&L: reported at ERROR, not booked
-        into today's figures, its row deleted. A row whose stop is not
-        saved, cannot be read, or did not fill (closed in the app, or the
-        save raced the exit) is logged at ERROR with what is known: its
-        P&L is unknown and not in the tally, and the row is pruned as
-        before.
+        broker-recovered. A saved disaster stop record that is still
+        ``unconfirmed`` (no id; the price and quantity it sent, and when) is
+        looked up among the orders entered from its submit on, as the
+        manager looks it up (``_unconfirmed_stop_fill``). What the running
+        bot had booked of that order before it stopped (the record's
+        ``booked_child_fills``) is left out, and the rest priced as its own
+        fills (``broker_payloads.unbooked_fill_price``): the saved quantity
+        is already net of those shares. The entry is
+        booked for the filled shares only; a remainder the broker holds
+        none of went some other way and is logged at ERROR, unbooked. The
+        row is deleted once booked: a save before the first successful
+        reconcile is an upsert that keeps it, and a retry or a restart
+        booked the fill again (the verifier's probes); the row of a
+        position this process closed itself goes at the engine's next
+        metadata save (``IntradayBot._save_reconcile_metadata``), so a stop
+        the manager booked is not booked here after a restart. A row whose
+        delete fails is remembered for the life of the process
+        (``_closes_booked``), so no retry books it a second time; the delete
+        is tried again at each.
+
+        The day the stop filled decides where the booking lands (the
+        fill's time: ``broker_payloads.order_filled_at``; 2026-11-10):
+
+        - Today: into the account (trades.csv, the day's figures), stamped
+          now, and ``risk.register_realized_pnl``, gain or loss, since the
+          price is an execution's.
+        - An earlier day: into the account with the fill's time as the
+          trade's exit time (``PaperAccount.record_exit``'s ``exit_time``),
+          so it is in trades.csv under its own day and in the run's
+          realized P&L, moves no figure of today's, and is not registered
+          with the risk manager: ``max_daily_loss`` is today's.
+        - A time that does not read (none in the payload, one after today
+          or before the position's entry), for a position entered before
+          today: booked stamped now, named at ERROR, and registered with
+          the risk manager only when it is a loss. The day it belongs to
+          is unknown; counting an unknown day's gain would widen today's
+          room. A position entered today filled today whatever the payload
+          says of the time: today's, as above.
+
+        Until 2026-11-10 the position's entry day stood in for the fill's
+        (a DAY stop fills the day it is entered): a position entered before
+        today was reported at ERROR and never booked, so a stop that filled
+        yesterday afternoon while the bot was down was in no trade, and a
+        good-till-cancelled stop (a strategy that holds across sessions)
+        could never have been booked at all.
+
+        A row whose stop is not saved or not found, cannot be read, or did
+        not fill (closed in the app, or the save raced the exit) is logged
+        at ERROR with what is known: its P&L is unknown and not in the
+        tally, and the row is pruned as before (kept, and the attempt
+        failed, while the stop cannot be read).
 
         Not judged: a dry run (paper positions never reach the broker), a
         key still tracked (the settle's), a symbol the broker still holds
@@ -629,53 +719,146 @@ class StartupReconciler:
             symbol = str(position.symbol or key).upper().strip()
             if key in self.positions or str(key).upper().strip() in held or symbol in held:
                 continue
+            if key in self._closes_booked:
+                # Booked by an earlier attempt of this process whose delete
+                # of the row failed: only the delete is tried again.
+                self._delete_reconcile_metadata_row(key)
+                continue
             metadata = position.metadata if isinstance(position.metadata, dict) else {}
             if is_option_asset(metadata):
                 LOG.warning("%s: an option position saved by the last run is not held by the broker; its close "
                             "while the bot was down is not booked (option exits are the engine's)", key)
                 continue
-            entered_day = position.entry_time.astimezone(now.tzinfo).date()
             bracket = metadata.get("bracket") if isinstance(metadata.get("bracket"), dict) else {}
             stop_id = bracket.get("stop_order_id")
-            if entered_day < now.date():
-                LOG.error("%s: %s %d at %.4f entered %s and saved by the last run is not held by the broker; its "
-                          "close (stop %s) belongs to that day and is not booked into today's figures: the broker "
-                          "statement has it", key, position.side.value, int(position.qty), float(position.entry_price),
-                          entered_day, stop_id or "none saved")
-                self._delete_reconcile_metadata_row(key)
-                continue
-            state = self.executor.order_state(str(stop_id)) if stop_id else None
+            # Why no fill of the stop is known, when none is: it could not
+            # be read (the row stays, the attempt fails), or it was not
+            # found; "" while it was read.
+            unread, absent = False, ""
+            if stop_id:
+                named = f"stop {stop_id}"
+                state = self.executor.order_state(str(stop_id))
+                unread = state is None
+            elif is_disaster_stop(bracket) and bracket.get("state") == "unconfirmed":
+                named = "the stop its unconfirmed record sent"
+                state, unread, absent = self._unconfirmed_stop_fill(key, position, bracket)
+            else:
+                named, state = "", None
             filled = int((state or {}).get("filled_qty") or 0)
-            price = safe_float((state or {}).get("fill_price"), None, finite=True)
-            if stop_id and state is None:
+            # Less what the running bot booked of this order before it
+            # stopped (the record's ledger, ``booked_child_part``), priced as
+            # the rest's own fills, as the manager's fill reconcile nets
+            # them: the saved quantity is already net of those shares, and
+            # the order's average covers both parts.
+            order_id = stop_id or (state or {}).get("order_id")
+            booked_qty, booked_notional, booked_estimated = (
+                booked_child_part(bracket, order_id) if order_id else (0, 0.0, False))
+            unbooked = filled - booked_qty
+            price, estimated = unbooked_fill_price(
+                filled, safe_float((state or {}).get("fill_price"), None, finite=True),
+                (state or {}).get("fill_price_estimated") is not False, booked_qty, booked_notional,
+                booked_estimated, what=f"{named} for {key}") if unbooked > 0 else (None, True)
+            if unread:
                 # The stop could not be read: the row stays for the retry,
                 # and the attempt fails at its end so one runs.
-                self._close_booking_error = f"{key}: stop {stop_id} could not be read"
-            if state is None or filled <= 0 or price is None or price <= 0:
+                self._close_booking_error = f"{key}: {named} could not be read"
+            if state is None or unbooked <= 0 or price is None or price <= 0:
                 LOG.error("%s: %s %d at %.4f saved by the last run is not held by the broker; its close while the bot "
                           "was down is not booked (%s). The day's loss tally does not count it: check the account",
                           key, position.side.value, int(position.qty), float(position.entry_price),
-                          "no stop order saved" if not stop_id
-                          else f"stop {stop_id} could not be read" if state is None
-                          else f"stop {stop_id} reads {state.get('status')} with {filled} filled")
+                          "no stop order saved" if not named
+                          else f"{named} could not be read" if unread
+                          else f"{named} {absent}" if state is None
+                          else f"{named} reads {state.get('status')} with {filled} filled"
+                          + (f", {booked_qty} of them booked before the restart" if booked_qty else ""))
                 continue
-            qty = min(int(position.qty), filled)
+            filled_at = self._fill_time_while_down(state, position, now)
+            earlier_day = filled_at is not None and filled_at.date() < now.date()
+            # No fill time that reads leaves the day unknown only for a
+            # position entered before today: one entered today filled today.
+            day_unknown = filled_at is None and position.entry_time.astimezone(now.tzinfo).date() < now.date()
+            qty = min(int(position.qty), unbooked)
             closed = copy.copy(position)
             closed.qty = qty
             self.account.record_restored_entry(closed, float(position.entry_price))
             realized = self.account.record_exit(
                 closed, float(price), protective_stop_reason(bracket), final_exit=True, remaining_qty_after_exit=0,
-                fill_price_estimated=state.get("fill_price_estimated") is not False, broker_recovered=True,
+                fill_price_estimated=estimated, broker_recovered=True,
+                exit_time=filled_at if earlier_day else None,
             )
-            self.risk.register_realized_pnl(float(realized))
-            LOG.warning("%s: closed while the bot was down: its stop %s filled %d of %d at %.4f (realized %.2f); "
-                        "booked and counted in the day's loss tally", key, stop_id, qty, int(position.qty),
-                        float(price), float(realized))
+            self._closes_booked.add(key)
+            self._carried_unmatched_reported.discard(symbol)
+            what = f"its {named.removeprefix('the ')} filled {qty} of {int(position.qty)} at {float(price):.4f}"
+            if day_unknown:
+                if float(realized) < 0:
+                    self.risk.register_realized_pnl(float(realized))
+                LOG.error("%s: closed while the bot was down: %s (realized %.2f), and the broker gives no fill time "
+                          "that reads (%r): booked at the restart's time, on a day it may not belong to, and %s",
+                          key, what, float(realized), state.get("filled_at"),
+                          "counted in the day's loss tally" if float(realized) < 0
+                          else "not counted in the day's loss tally (a gain of an unknown day)")
+            elif earlier_day:
+                LOG.warning("%s: closed while the bot was down: %s on %s (realized %.2f); booked at its fill time "
+                            "%s, in no figure of today's and not in today's loss tally", key, what, filled_at.date(),
+                            float(realized), filled_at.isoformat())
+            else:
+                self.risk.register_realized_pnl(float(realized))
+                LOG.warning("%s: closed while the bot was down: %s (realized %.2f); booked and counted in the day's "
+                            "loss tally", key, what, float(realized))
             if qty < int(position.qty):
                 LOG.error("%s: %d of its %d shares are not in the stop's fill and the broker holds none; how they "
                           "closed is unknown and not booked: check the account", key, int(position.qty) - qty,
                           int(position.qty))
             self._delete_reconcile_metadata_row(key)
+
+    def _unconfirmed_stop_fill(self, key: str, position: Position,
+                               record: dict[str, Any]) -> tuple[dict[str, Any] | None, bool, str]:
+        """What the disaster stop a saved ``unconfirmed`` record sent
+        filled, for a position the broker no longer holds: ``(state,
+        unread, absent)``. *state* is the stop's row among the orders
+        entered from ``DISASTER_STOP_RETRY_SECONDS`` before its submit on
+        (``broker_payloads.sent_exit_stop``: the exit STOP at exactly the
+        price and quantity sent), in the shape ``executor.order_state``
+        answers in, with its order id. It is None, *absent* saying why,
+        when no such order is listed (it never landed) or the record does
+        not say what to look for (no submit time, price or quantity that
+        reads; logged at ERROR, a submit time with its error's type).
+        *unread* is True when the orders could not be read: the caller
+        keeps the row and fails the attempt. A replacement of that stop
+        (moved in the app) is not followed, as a saved stop's is not."""
+        try:
+            since = datetime.fromisoformat(str(record.get("sent_at"))) - timedelta(seconds=DISASTER_STOP_RETRY_SECONDS)
+        except (TypeError, ValueError) as exc:
+            LOG.error("%s: its unconfirmed disaster stop record carries no submit time that reads (%r; %s: %s), so "
+                      "the stop it sent cannot be looked up", key, record.get("sent_at"), type(exc).__name__, exc)
+            return None, False, "was not looked up: its record carries no submit time that reads"
+        if safe_float(record.get("stop_price"), None, finite=True) is None or safe_int(record.get("qty")) is None:
+            LOG.error("%s: its unconfirmed disaster stop record carries no price or quantity that reads (%r, %r), "
+                      "so the stop it sent cannot be looked up", key, record.get("stop_price"), record.get("qty"))
+            return None, False, "was not looked up: its record carries no price or quantity that reads"
+        orders = self.executor.todays_orders(since)
+        if orders is None:
+            return None, True, ""
+        match = sent_exit_stop(orders, str(position.metadata.get("underlying") or position.symbol), position.side,
+                               stop_price=record.get("stop_price"), qty=record.get("qty"))
+        if match is None:
+            return None, False, "is not among the account's orders"
+        return {"order_id": match.get("orderId"), "status": match.get("status"),
+                "filled_qty": order_row_filled_qty(match), "fill_price": match.get("fillPrice"),
+                "fill_price_estimated": match.get("fillPriceEstimated"), "filled_at": match.get("filledAt")}, False, ""
+
+    @staticmethod
+    def _fill_time_while_down(state: dict[str, Any], position: Position, now: datetime) -> datetime | None:
+        """When the stop of *state* filled, in *now*'s zone, or None when
+        the broker gives no time that reads or one that cannot be the
+        fill's: after *now*'s day, or before the position was entered."""
+        filled_at = state.get("filled_at")
+        if not isinstance(filled_at, datetime) or filled_at.utcoffset() is None:
+            return None
+        filled_at = filled_at.astimezone(now.tzinfo)
+        if filled_at.date() > now.date() or filled_at < position.entry_time.astimezone(now.tzinfo):
+            return None
+        return filled_at
 
     def _delete_reconcile_metadata_row(self, key: str) -> None:
         """Delete *key*'s saved row once its position is settled here, so no
@@ -878,18 +1061,37 @@ class StartupReconciler:
         or the exit order it left working before the restart (settled from
         its own fill record by the first management cycle). Counting that
         exit as foreign blocked every entry for the session, and "clear
-        them" meant cancelling the position's own exit (2026-09-25)."""
+        them" meant cancelling the position's own exit (2026-09-25).
+
+        For a live strategy that holds across sessions, the stop a tracked
+        position's ``unconfirmed`` disaster record sent is its own too
+        (``broker_payloads.sent_exit_stop``: the exit STOP at exactly the
+        price and quantity sent; 2026-11-10). Its stop is
+        good-till-cancelled: a submit whose outcome was unknown in the last
+        minute of a session leaves the record unconfirmed overnight (no
+        management pass looks it up before 09:30), the stop rests through
+        it, and the next day's reconcile read it as foreign: entries were
+        blocked for that day, and "clear them" meant cancelling the
+        position's only broker stop. A DAY stop was dead by then."""
         owned: set[str] = set()
+        held_live = self.config.active_holds_across_sessions and not self.config.schwab.dry_run
         for position in self.positions.values():
             record = position.metadata.get("working_exit_order") if isinstance(position.metadata, dict) else None
             if isinstance(record, dict) and record.get("order_id"):
                 owned.add(str(record["order_id"]))
             bracket = position.metadata.get("bracket") if isinstance(position.metadata, dict) else None
+            if not isinstance(bracket, dict):
+                continue
+            if held_live and is_disaster_stop(bracket) and bracket.get("state") == "unconfirmed":
+                sent = sent_exit_stop(working_orders, str(position.metadata.get("underlying") or position.symbol),
+                                      position.side, stop_price=bracket.get("stop_price"), qty=bracket.get("qty"))
+                if sent is not None:
+                    owned.add(str(sent.get("orderId")))
             # A dry run's bracket is simulated (the engine owns the exits) but
             # keeps the ids of the real protection it stands for: that order
             # is the position's own in a dry run too, and read as foreign it
             # blocked every entry of the dry run (2026-09-25).
-            if not isinstance(bracket, dict) or not (bracket.get("active") or bracket.get("simulated")):
+            if not (bracket.get("active") or bracket.get("simulated")):
                 continue
             owned |= bracket_order_ids(bracket)
         return [order for order in working_orders if str(order.get("orderId")) not in owned]
@@ -933,6 +1135,10 @@ class StartupReconciler:
         were restored and how many skipped, and a message naming each row
         that cannot be used (a quantity or an ``averagePrice`` that does not
         read).
+
+        A broker row that matches none of the saved rows a live strategy
+        that holds across sessions has on its symbol is unusable too
+        (``_carried_rows_left_unmatched``).
 
         The caller fails the attempt on those messages, once every other row
         is restored: those positions are tracked and managed, stops included,
@@ -1008,6 +1214,21 @@ class StartupReconciler:
             if matched_info is not None:
                 matched_metadata_keys.add(str(matched_info[0]))
             if bool(getattr(getattr(self, "strategy", None), "requires_hybrid_startup_restore_metadata", lambda: False)()) and matched is None:
+                carried = self._carried_rows_left_unmatched(metadata_positions, symbol)
+                if carried:
+                    named = (f"the broker holds {side.value} {qty} {symbol} at {entry_price:.4f}, which matches no "
+                             f"saved row of it ({'; '.join(carried)}): a stop or an exit filled in part while the bot "
+                             "was down, or the holding changed at the broker. It is not restored or managed, its row "
+                             "is kept, and entries wait until the account and the row agree")
+                    unusable.append(named)
+                    if symbol not in self._carried_unmatched_reported:
+                        # Once: every retry fails on it until a human acts,
+                        # and until then only its broker stop protects it.
+                        self._carried_unmatched_reported.add(symbol)
+                        LOG.critical("CARRIED POSITION UNMANAGED — %s. To end it: cancel its stop at the broker, "
+                                     "then close the rest of it (the next attempt books what the stop sold), or "
+                                     "bring the holding back to what the row says.", named)
+                    continue
                 LOG.warning("Skipping startup restore for %s because %s requires hybrid metadata", symbol, self.config.strategy)
                 skipped += 1
                 continue
@@ -1094,6 +1315,7 @@ class StartupReconciler:
                 )
             self._reprotect_restored_position(position, working_orders)
             self.positions[symbol] = position
+            self._carried_unmatched_reported.discard(symbol)
             try:
                 # Booked at the broker's average price; the account's day
                 # figures count its move from the mark the day's row valued
