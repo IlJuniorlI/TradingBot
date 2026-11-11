@@ -132,7 +132,10 @@ runtime:
   log_position_marks: true
   reconcile_on_startup: true
   # A dry run's positions are not in the broker account, so there is nothing
-  # to reconcile against.
+  # to reconcile against. These two are the dry run's values: a live run of
+  # this strategy (refused today) would also be refused at load with them,
+  # which asks for restore_hybrid and an order lookback of at least 20 days
+  # for the 10-session hold (the strategy's README, "The live path").
   startup_reconcile_mode: ignore
   startup_order_lookback_days: 2
   startup_reconcile_ignore_symbols: []
@@ -201,7 +204,10 @@ chart_patterns:
 dashboard:
   enabled: true
   host: 127.0.0.1
-  port: 8765
+  # Its own port, one above every other preset's 8765: this strategy runs
+  # as a second bot beside a day-trading one, and the second bot to ask for
+  # a port in use starts with no dashboard (logged, not fatal).
+  port: 8766
   refresh_ms: 1500
   state_path: .logs_swing/dashboard_state.json
   client_idle_seconds: 30.0

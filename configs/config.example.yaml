@@ -314,7 +314,13 @@ execution:
   # left resting (reconcile_on_startup false, startup_reconcile_mode ignore or
   # log_only). Every disaster_stop_escalation_attempts-th consecutive attempt
   # that leaves a position without its stop (refused, unknown outcome, a
-  # cancel before an exit not confirmed) logs a CRITICAL.
+  # cancel before an exit not confirmed) logs a CRITICAL (DISASTER STOP
+  # DEGRADED). The same count paces three more: EXIT ORDERS LEFT (a
+  # post-close sweep that cannot read the leftover orders, cannot cancel
+  # them, or after a restart may not yet), ORDER REPLACED UNTRACKED (an
+  # entry, exit or protective order REPLACED at the broker whose replacement
+  # is not found) and POSITION HELD FOR SETTLE (a handed position whose
+  # settle keeps failing).
   disaster_stop_enabled: true
   disaster_stop_r: 1.0
   disaster_stop_min_pct: 0.0025

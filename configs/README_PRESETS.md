@@ -119,7 +119,7 @@ No other preset value changed. Three fixes and two manifest exemptions change wh
 ## The static disaster stop (2026-09-28)
 
 - Every equity preset ships `execution.disaster_stop_enabled: true` with `disaster_stop_r: 1.0`, `disaster_stop_min_pct: 0.0025` and `disaster_stop_escalation_attempts: 3`; the two 0DTE presets ship it `false`. On is the code default and it is refused on for an options strategy, so an options config must say `false`. Every preset declares the four (the 0DTE presets the switch). `tests/guards/test_preset_parity.py` pins them, and the local `config.yaml` when it exists.
-- Going live (`schwab.dry_run: false`) with it on needs a startup reconcile that sees the stops a restart finds resting: `runtime.startup_reconcile_mode` `block`, `restore_basic` or `restore_hybrid`, with `reconcile_on_startup: true`. `ignore` and `log_only` (top_tier_adaptive, small_cap_squeeze, opening_range_breakout, the three peer_confirmed presets on `ignore`, the microcap pair) are refused at load then, naming both keys.
+- Going live (`schwab.dry_run: false`) with it on needs a startup reconcile that sees the stops a restart finds resting: `runtime.startup_reconcile_mode` `block`, `restore_basic` or `restore_hybrid`, with `reconcile_on_startup: true`. `ignore` and `log_only` (top_tier_adaptive, small_cap_squeeze, opening_range_breakout, the three peer_confirmed presets on `ignore`, the microcap pair) are refused at load then, naming both keys. `swing_leader_pullback` is on `ignore` too, and live it needs `restore_hybrid` and nothing else (its section below).
 - A dry run places nothing, so no dry-run result moves: each position carries its `disaster_stop_price` and a `simulated` record.
 - Live, it is a far resting `STOP` the engine never moves (root README, `execution`). On the 22 archived equity days (176 trades with a tape) it would have fired on none while the engine held the trade; counting every print of the entry and exit minutes, once (ADBE 2026-09-24, in the minute the engine itself stopped out). At 0.5R with no floor it fired on AMZN 2026-09-23 (R $0.075), which the 0.25% floor removes.
 
@@ -135,4 +135,19 @@ No other preset value changed. Three fixes and two manifest exemptions change wh
 - `trend_day_pass_sector_pct: 1.5` and `trend_day_pass_until: "11:00"` switch the trend-day pass on (the manifests declare `0.0`, off). `peak_giveback_high_conviction_bridge_retain: 0.5` switches the override's bridge on (the manifests declare `0.0`). `small_cap_squeeze` sets neither and runs with both off.
 - The `orb_*` comments no longer say that `disable_orb_regime: false` restores a tuned regime: as set it takes no trade (`orb_max_range_atr_mult`), and with that cap off it lost 12.51R on 118 replayed trades. The values are unchanged.
 - The evidence and its limits are in the strategy README, section 25.
+
+## peer_confirmed_key_levels: the entry gates retuned (2026-11-10)
+
+- `min_level_score: 2.0` (was 2.9), `min_peer_agreement: 2` (3), `min_peer_score: 1` (2), `min_ltf_score: 2.0` (2.5) and `require_htf_bias_alignment: false` (true). An HTF bias against the side still refuses it. The macro gate, the structure veto, the stops, the targets and the exits are unchanged.
+- At the old values the real code opened 3 trades in 31 replayed regular sessions (2026-09-18 to 11-09), all losers. With every gate loose (335 trades) none of the four separated winners from losers. Replayed with the macro gate on, the new values took 44 trades, 61% winners, +12.3R net of spreads. The values were chosen on those days, so the dry run is the test.
+- Only this preset moved: the manifest's defaults and `peer_confirmed_key_levels_1m` are unchanged. `tests/strategies/test_peer_key_levels_gates.py` pins the five values. The strategy README has the note under "Shipped reference".
+
+## swing_leader_pullback: a preset for a second bot (2026-11-10; its own dashboard port 2026-11-11)
+
+- **Dry run only.** The strategy refuses to build with `schwab.dry_run: false` (its README, "The live path (built, not enabled)").
+- **Its row in the knob table at the top is all 0.** All `shared_entry` vetoes, refinements and score terms, the `shared_exit` families, the time stop and intraday S/R (`support_resistance.enabled: false`) are off, with `risk.trade_management_mode: none` and peak giveback off: each would close a multi-day position early or move its stop. The exits are the stop and the strategy's own close-time check.
+- **Its own folder and port.** `runtime.log_dir: .logs_swing`, with `runtime.startup_reconcile_metadata_db_path` and `dashboard.state_path` under it, and `dashboard.port: 8766`. Every other preset writes `.logs` and serves 8765. It is meant to run as a second process beside a day-trading bot: on a shared state file the other bot's first save would delete this strategy's saved positions, and on a shared port the second bot starts with no dashboard. The two share the Schwab login (`schwab.tokens_db`).
+- **It stays up.** `runtime.auto_exit_after_session: false`, with `execution.extended_hours_enabled: false`: it carries positions for up to ten sessions and trades the regular session only. A dry-run restart takes the open paper positions back.
+- **Its restart values are the dry run's.** `runtime.startup_reconcile_mode: ignore` and `startup_order_lookback_days: 2`. A live run would be refused at load with them: it needs `restore_hybrid` and a lookback of at least 20 days for the 10-session hold.
+- **Sizing.** `risk.max_positions: 10`, `max_notional_per_trade: 5000`, `risk_per_trade_frac_of_notional: 0.06`, `max_daily_loss: 3500` (the ten slices' open risk counts against it), `allow_short: false`.
 

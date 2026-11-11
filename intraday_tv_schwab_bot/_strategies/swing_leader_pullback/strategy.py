@@ -149,9 +149,9 @@ class SwingLeaderPullbackStrategy(BaseStrategy):
         if not bool(config.schwab.dry_run):
             raise ValueError(
                 "swing_leader_pullback runs in a dry run only (schwab.dry_run: true). It holds positions across "
-                "sessions, and the live path is not built for that: the resting disaster stop is a DAY order that "
-                "expires at each close, and a restart restores no multi-day position with its stop and entry "
-                "session. See the strategy's README, 'What is not built'.")
+                "sessions, and the live path for that is built but has never met the broker: the refusal stays "
+                "until its broker facts are checked by hand and the owner signs off. See the strategy's README, "
+                "'The live path (built, not enabled)'.")
         # The session each symbol was last entered on (from the positions
         # the entry pass sees): one entry a session per symbol, so a
         # position stopped out in the entry window is not bought again on

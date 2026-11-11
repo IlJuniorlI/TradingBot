@@ -603,7 +603,7 @@ is today's while it lasts, else the next trading day's, and a session ends
 at the regular close (13:00 on an early-close day) or the strategy's last
 window, whichever is later; weekends and exchange holidays hold none. The
 WARNING comes a trading day ahead because a bot that exits after each
-session (`auto_exit_after_session`, on in all but one shipped preset) logs
+session (`auto_exit_after_session`, on in all but two shipped presets, `peer_confirmed_key_levels` and `swing_leader_pullback`) logs
 this once a day, at start-up, and the next day's start-up may meet
 schwabdev's prompt inside the client's own start, before the bot logs
 anything: the day before is the last warning you can act on outside a
@@ -885,14 +885,42 @@ systemctl --user restart intraday-bot
 
 The clean-shutdown path runs first (writes session report + archive
 unless it wrote them at 8pm ET, and appends its trades to trades.csv),
-then the new code starts. In live mode the open positions are restored
-from the broker at the start, their levels from the reconcile metadata
-SQLite store. A dry run's paper positions are not restored: each one open
-at the restart is dropped, logged when the start-up reconcile ends
-(`Day ledger: <symbol> <side> <qty>, open in the <day> row, was not
-restored: its move up to the restart, <amount>, stays in the day's P&L,
-never realized and in no trade`), and that move stays in the day's P&L.
-Restart a dry run flat (top_tier is flat from 15:50).
+then the new code starts. In live mode, under
+`runtime.startup_reconcile_mode: restore_basic` or `restore_hybrid`, the
+open positions are restored from the broker at the start (`restore_hybrid`
+takes their levels from the reconcile metadata SQLite store); `block`
+restores nothing and blocks entries when the reconcile finds a position or
+a working order, until a later reconcile clears it; `log_only` logs them;
+`ignore` skips the check. A dry run's paper positions
+are not restored: each one open at the restart is dropped, logged when the
+start-up reconcile ends (`Day ledger: <symbol> <side> <qty>, open in the
+<day> row, was not restored: its move up to the restart, <amount>, stays
+in the day's P&L, never realized and in no trade`), and that move stays in
+the day's P&L. Restart a dry run flat (top_tier is flat from 15:50). The
+exception is a strategy that holds across sessions
+(`swing_leader_pullback`): its dry-run restart takes its open paper
+positions back from its saved rows, in every reconcile mode, though
+nothing is simulated for the time the bot was down.
+
+### Running the swing preset as a second bot
+
+`configs/config.swing_leader_pullback.yaml` holds positions for up to ten
+sessions and runs in a dry run only (the strategy refuses
+`schwab.dry_run: false`). A bot runs one strategy, so it is a second
+process beside a day-trading bot: a second unit file with its own
+`--config`, from the same folder.
+
+- It keeps its logs, `trades.csv`, day figures, saved positions and
+  dashboard state under `.logs_swing`, where every other preset writes
+  `.logs`. Never point two bots at one state file: each replaces the saved
+  positions with its own at a save.
+- Its dashboard serves port `8766`; the other presets serve `8765`. A bot
+  that finds its port taken starts with no dashboard.
+- Both bots share the one Schwab login (`.schwabdev/tokens.db`). Their
+  combined request rate has not been measured.
+- Start it before 09:00 ET and leave it running. It does not exit after
+  the session (`auto_exit_after_session: false`), and a start after 10:00
+  skips that day's setups.
 
 ---
 
