@@ -9,6 +9,29 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A dry-run restart keeps the paper positions of a strategy that holds
+  across sessions (2026-11-10).** A strategy declares the hold in its
+  manifest, `capabilities.holding: {"across_sessions": true,
+  "max_sessions_param": "<param>"}` (validated at load; it requires
+  `capabilities.startup_restore.require_hybrid_metadata: true`), read as
+  `BotConfig.active_holds_across_sessions` and
+  `BaseStrategy.holds_across_sessions()`; `swing_leader_pullback` is the one
+  that does. For such a strategy in a dry run, the run's first reconcile
+  takes back the positions the earlier process saved
+  (`StartupReconciler.restore_paper_positions`): each is tracked with its
+  saved entry time, stop and metadata and entered in the paper account at
+  its entry price. The reconcile store now marks each row with whether a
+  dry run wrote it (a new `dry_run` column, added to an existing file), and
+  only this strategy's own paper rows are restored: another strategy's
+  row, a live run's, an option, a row with an exit order working or a real
+  stop record, unreadable levels and a key already tracked are each refused
+  at ERROR. A store that cannot be read fails the start-up. Until then no
+  mode restored a paper position: the restore walks the broker account,
+  and the first reconcile's save replaced the saved rows with an empty
+  book. Nothing is simulated while the bot is down: a stop crossed
+  meanwhile exits at the first pass's price. Every other strategy's
+  restart, and every live restart, is unchanged.
+
 - **`swing_leader_pullback`, a daily-bar swing strategy (2026-11-10; dry run
   only).** The first strategy that holds positions across sessions. Its
   screener ranks the members of the configured TradingView indexes (the
@@ -24,9 +47,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stock list is today's survivors. `test_rule_parity.py` drives the rule
   over three names' bars and gets the study's 102 trades. The strategy
   refuses to build with `schwab.dry_run: false`: the live path's resting
-  stop is a DAY order and a restart restores no multi-day position. A
-  dry-run restart drops the open paper positions. Earnings are not
-  avoided. New preset
+  stop is a DAY order and a restart restores no multi-day position.
+  Earnings are not avoided. New preset
   `configs/config.swing_leader_pullback.yaml`; the strategy's README has the
   rule, the measurement and what is not built.
 
