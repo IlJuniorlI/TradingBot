@@ -407,6 +407,7 @@ Behavior and valid values:
     - The estimated loss of a close outside the bot counts toward `max_daily_loss`; an estimated gain does not, since the mark can be stale.
     - A position whose entry order is still settling is left to the entry gatekeeper: the reconcile books unsettled entry orders from their own fill records first, restores nothing and settles nothing against an order still settling, and fails the attempt until it has.
     - The session-boundary reconcile runs before the cycle, so the first premarket cycle no longer manages positions closed overnight.
+    - A position the position manager hands to the settle while the bot runs (a stop moved in the app that left nothing resting, with shares sold by orders the bot cannot book) is settled alone on the next pass, in every mode and with `reconcile_on_startup` false (2026-11-11): no other position is compared with the account, nothing is restored and no entry block is set. See "A stop moved in the app" under the disaster stop.
   - A saved position the account no longer holds closed while the bot was down, by its broker stop or in the app. A live restart books it from the stop's own fill (its quantity and price as the broker reports them, the reason the running bot books that stop with, marked `broker_recovered`) before any prune reads its row as stale (2026-11-08), and deletes the row once booked. The day the stop filled decides where the booking lands (2026-11-10; the fill's time is the newest execution's when every execution carries one, else a FILLED order's close time):
     - Today: stamped at the restart, in the day's figures and in the `max_daily_loss` tally, gain or loss.
     - An earlier day: booked with the fill's time as the trade's exit time, so it is in trades.csv under its own date and in the run's realized P&L, in no day's figures and not in the tally. That day's report and archive are not rewritten. One exception: at a restart on a weekend or a holiday the day ledger is still the last trading day's, and a fill on that day books into that day's figures, as an exit made then would have. Until 2026-11-10 the position's entry day stood in for the fill's (a DAY stop fills the day it is entered), so a position entered before today was reported at ERROR and never booked: a stop that filled yesterday afternoon while the bot was down was in no trade. This holds for every strategy, and so does its other side: a position carried overnight (by a restore mode) whose stop filled today is booked as today's, where its entry day used to leave it unbooked.
@@ -535,7 +536,7 @@ Behavior and valid values:
 - `disaster_stop_enabled`: rest a static disaster stop at the broker for each equity position. See below. On unless a config says `false`: on in every equity preset, off in the two option presets (an options config must say `false`, or it is refused).
 - `disaster_stop_r`: how far beyond the initial stop the disaster stop rests, in units of the trade's initial R. A finite number above 0.
 - `disaster_stop_min_pct`: the least that distance can be, as a fraction of the entry price (0 turns the floor off). A finite number in [0, 1].
-- `disaster_stop_escalation_attempts`: every this-many consecutive attempts that leave a position without its disaster stop log a CRITICAL naming it (`DISASTER STOP DEGRADED`), every this-many consecutive failed reads of a closed position's post-close sweep too (`EXIT ORDERS LEFT`), and every this-many consecutive passes a position is held because an order changed in the app (a working exit, or its resting stop or target) has a replacement the orders do not show (`ORDER REPLACED UNTRACKED`). An integer >= 1.
+- `disaster_stop_escalation_attempts`: every this-many consecutive attempts that leave a position without its disaster stop log a CRITICAL naming it (`DISASTER STOP DEGRADED`), every this-many consecutive failed reads of a closed position's post-close sweep too (`EXIT ORDERS LEFT`), every this-many consecutive passes a position is held because an order changed in the app (a working exit, or its resting stop or target) has a replacement the orders do not show (`ORDER REPLACED UNTRACKED`), and every this-many consecutive failed tries at the settle of a position handed to it (`POSITION HELD FOR SETTLE`). An integer >= 1.
 
 #### Broker-side bracket orders
 
@@ -702,9 +703,10 @@ off from the broker.
   each broker reconcile), not only at the next management pass: the leftover
   would be live at 09:30:00, ahead of that pass, against a position no longer
   held, and the new day's reconcile would read it as a foreign order. When
-  the try ahead of that reconcile fails too, the reconcile still counts the
-  leftover as foreign and the day's entries stay blocked, though the sweep
-  cancels it a minute later: a restart clears the block.
+  the try ahead of that reconcile fails too, the reconcile counts the
+  leftover as foreign and blocks entries, and runs once more when the sweep
+  has cancelled it (2026-11-11). A sweep still owed at a restart is owed
+  again by the next run, see "After a full close" below.
   No live strategy uses this yet: the one strategy that declares the
   capability, `swing_leader_pullback`, still refuses a live run. The duration
   string and Schwab's handling of such a stop (its lifetime, an ex-dividend
@@ -790,27 +792,61 @@ off from the broker.
   is followed to the cancelled order, and a fresh stop is placed; a trailing
   stop is a stop's kind; one changed into a limit order is the one exit order
   of another kind entered after it that may still rest); the record is
-  re-pointed and saved. The price it was moved to is kept. A quantity larger
+  re-pointed and saved. The price it was moved to is kept, and becomes the
+  position's backup level (`disaster_stop_price`; the bot's own is kept
+  beside it as `disaster_stop_own_price`): every stop the bot places afresh
+  for the position, after a partial exit, a cancel in the app, a refused
+  resize or a restart, rests at the moved price, where it used to go back to
+  the bot's own level. That holds once a management pass has seen the moved
+  stop working (a plain stop; a trailing stop's level moves by itself and is
+  not kept), and for a stop moved while the bot was down that a restore
+  adopted. A moved price the last price is already through when a stop has
+  to be placed gives way to the bot's own level from then on, logged: sent
+  at such a level the stop is refused, or sells at once. A bracket's stop
+  follows the engine's level and is not touched. A quantity larger
   than the shares held is cut to them at once; a smaller one is left as it
   was sized (the bot's own count is too high once shares were sold by hand,
   so it enlarges no order it did not size). From then on the replacement is
-  the position's stop: its fill is booked, an exit cancels it first. While
+  the position's stop: its fill is booked, an exit cancels it first. A stop
+  changed into an order that is no stop (a limit order) is tracked in the
+  stop's place all the same, and an ERROR says that no stop rests at the
+  broker for the position while it stands; the first time it has to be cut
+  down it is re-issued as the bot's plain stop at the old stop level. While
   the replacement cannot be found (two orders that may be it, a cancelled one
   beside it that sold shares, orders that cannot be read) the position is
   held: no exit goes out beside it, the close's force flatten included, and
   nothing is placed; every such pass logs at ERROR and every
   `disaster_stop_escalation_attempts`-th `ORDER REPLACED UNTRACKED` at
   CRITICAL, naming the symbol. The hold ends when the orders show one
-  replacement: cancel any other exit order on the symbol at the broker. When
+  replacement: cancel any other exit order on the symbol at the broker. Late
+  entry fills that grow a held position send no resize (sent to the
+  `REPLACED` order it was refused, and counted as a miss): the stop is
+  resized to the shares held on the first pass after the hold. When
   every exit order entered after it has filled or died, nothing rests and
   there is nothing to hold for, once the orders have said so for a minute (a
   listing can run behind; the position is held meanwhile): with nothing sold
   a fresh stop is placed;
   with shares sold (the stop turned into a limit order that filled, a sale
-  made by hand) nothing is booked from those orders, the position is held for
-  the broker reconcile, which runs on the next pass, compares it with the
-  account and books what left it. The broker reconcile runs the same follow
-  first, and a
+  made by hand) nothing is booked from those orders, and the position is
+  held for its settle against the account, which the engine runs for that
+  position alone on the next pass (`StartupReconciler.settle_handed_positions`):
+  the account is read, what left it is booked as `closed_outside_bot`, the
+  position is cut to what is held or dropped, and the pass after places a
+  stop for the rest. It runs whatever `startup_reconcile_mode` is and with
+  the reconcile off, compares no other position, restores nothing and sets
+  no entry block; a position its own follow hands over meanwhile is settled
+  in the same try. A try that fails is repeated 10 s later, then at a
+  doubling interval up to 300 s, at ERROR, and every
+  `disaster_stop_escalation_attempts`-th logs `POSITION HELD FOR SETTLE` at
+  CRITICAL; a position handed over during that wait is tried at once, and a
+  try that raises holds every handed position again. (In the first build of 2026-11-11 the hand-off was to the whole
+  broker reconcile: in mode `block` that reconcile, run mid-session, counted
+  the bot's own open positions and blocked every entry for the rest of the
+  day, and with the reconcile off or in mode `ignore`, which a live run can
+  have with bracket orders, it never ran and the position stayed held until
+  a restart.) Shares of the symbol held in the account for another reason
+  hide what was sold, as they do from the reconcile. The broker reconcile
+  runs the same follow first, and a
   restart follows the saved stop the same way. Until this the record kept the
   old id:
   the exit's cancel read it as down and the exit went out beside the
@@ -828,11 +864,44 @@ off from the broker.
   the sweep is tried again at the start of every management pass; while a sweep
   is owed the symbol takes no entry, and every
   `disaster_stop_escalation_attempts`-th consecutive failed read logs `EXIT
-  ORDERS LEFT` too (a restart forgets an owed sweep). The sweep never cancels
+  ORDERS LEFT` too. The sweep never cancels
   an order an open position tracks: a position opened in the symbol while it
   is owed (an unsettled entry order's late fill) keeps its stop. The bot takes
   the account's position in a symbol it trades as its own, as the startup
   reconcile does.
+  A sweep still owed is saved in the state file (the `owed_exit_sweeps` table
+  of `startup_reconcile_metadata_db_path`, written when what is owed changes
+  and made by the first such write) and owed again by the next run, before
+  its startup reconcile (2026-11-11): the symbol takes no entry, the leftover
+  is cancelled by the bot, and a reconcile that blocked entries on it runs
+  once more when the sweep is done. Until then a restart forgot it, and the
+  leftover blocked every entry as an order the bot did not own until it was
+  cancelled by hand. A sweep an earlier run owed reads the account before it
+  cancels: while the account holds shares of the symbol on that side beyond
+  the ones the bot tracks, or cannot be read, it cancels nothing (one of the
+  orders may be the stop of a position opened while the sweep was owed, which
+  a restart in mode `block` does not bring back), stays owed, logs an ERROR
+  and tries again a minute later; every
+  `disaster_stop_escalation_attempts`-th such try logs `EXIT ORDERS LEFT` at
+  CRITICAL. A sweep this run owes for a symbol where an earlier run's is
+  still owed takes its place and its look at the account. A dry run owes no
+  sweep and leaves a live run's saved ones where they are. A row that does
+  not read is logged with its type and dropped. A state file that cannot be
+  read at start-up owes none for now, at ERROR: it is read again once a
+  minute, nothing is written over it until it reads, and a reconcile that
+  blocked entries on working orders meanwhile runs once more when the
+  sweeps it then owes are done.
+  While an open position in the symbol has a disaster stop whose outcome is
+  not known yet (an `unconfirmed` record, which names no order), a sweep
+  leaves the exit `STOP`s that rest at exactly the price and size that
+  record sent and that the record can still take: the ones entered since
+  its submit when its own stop is listed, and every one when it is not (the
+  submit did not land, or the record is a restore's and its stop rests from
+  before the restart), which the record's placement then adopts. Every
+  other exit order is still cancelled, the
+  sweep stays owed while one is left, and says so once (2026-11-11; until
+  then the sweep cancelled that stop too, and a fresh one was placed a pass
+  later).
 - **Restarts.** A restore adopts a disaster stop still resting for the position
   (resized to what is held, with what it sold before the restart booked on it:
   the shares restored are already net of those) rather than placing a second

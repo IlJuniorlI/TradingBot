@@ -261,6 +261,72 @@ class ReconcileMetadataStore:
             conn.close()
         return {str(key): json.loads(raw) for key, raw in rows}
 
+    def save_owed_sweeps(self, records: dict[str, dict[str, Any]]) -> None:
+        """Replace every stored owed post-close sweep with *records* (the
+        position manager's ``_sweeps_owed``, already serialisable), so a
+        restart cancels the exit orders a closed position left working
+        instead of forgetting them (2026-11-11): the table holds exactly
+        what the manager owes, so an empty dict clears it. Raises on a store
+        that cannot be written; the caller logs it.
+
+        The table (``owed_exit_sweeps``) is created here, by the first
+        WRITE, never by a read, as the ``dry_run`` column is: a file an
+        earlier version wrote that can be read but not written still reads
+        as it did (``load_owed_sweeps`` reads a file without the table as
+        holding none)."""
+        self._ensure_ready()
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [{"position_key": str(key), "record_json": json.dumps(json_safe(record, non_finite="keep"), sort_keys=True),
+                 "updated_at": now} for key, record in records.items()]
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS owed_exit_sweeps (
+                    position_key TEXT PRIMARY KEY,
+                    record_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("DELETE FROM owed_exit_sweeps")
+            if rows:
+                conn.executemany(
+                    "INSERT INTO owed_exit_sweeps (position_key, record_json, updated_at) "
+                    "VALUES (:position_key, :record_json, :updated_at)", rows)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def load_owed_sweeps(self) -> dict[str, Any]:
+        """The stored owed post-close sweeps, by position key, as saved. A
+        missing file has none, and so has a file no sweep was ever saved to
+        (it has no ``owed_exit_sweeps`` table; ``save_owed_sweeps`` creates
+        it). A store that cannot be read raises: it is never read as empty
+        (the caller decides what an unknown record means). A row whose
+        JSON does not parse comes back as its stored text, for the caller
+        to report and drop on its own: raised here, one such row lost every
+        other row with it (the verifier's probe)."""
+        if not self.path.exists():
+            return {}
+        self._ensure_ready()
+        conn = sqlite3.connect(self.path)
+        try:
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'owed_exit_sweeps'"
+                            ).fetchone() is None:
+                return {}
+            rows = conn.execute(
+                "SELECT position_key, record_json FROM owed_exit_sweeps ORDER BY position_key").fetchall()
+        finally:
+            conn.close()
+        out: dict[str, Any] = {}
+        for key, raw in rows:
+            try:
+                out[str(key)] = json.loads(raw)
+            except ValueError:
+                out[str(key)] = raw
+        return out
+
     def load_positions(self) -> dict[str, Position]:
         """The saved rows as positions, by position key. A missing file is
         an empty store. A store that cannot be read (locked past sqlite's

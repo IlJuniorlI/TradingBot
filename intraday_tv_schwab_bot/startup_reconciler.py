@@ -1025,9 +1025,93 @@ class StartupReconciler:
         except Exception as exc:
             LOG.warning("%s: could not delete its startup reconcile metadata row (%s: %s)", key, type(exc).__name__, exc)
 
+    def _held_for_settle(self) -> set[str]:
+        """The keys of the positions held for a settle against the account
+        (``settle_pending``)."""
+        return {key for key, position in self.positions.items()
+                if isinstance(position.metadata, dict) and position.metadata.get("settle_pending")}
+
+    def settle_handed_positions(self) -> bool:
+        """Settle against the broker account the positions the manager
+        handed over, and no other (2026-11-11): the ones held with
+        ``settle_pending``. True once none of them is held any more.
+
+        The follow of a REPLACED stop hands a position over when nothing
+        entered after the stop can still rest and those orders sold shares
+        it cannot book (``PositionManager._replaced_child_gone``): only the
+        account says what is held. The settle is the reconcile's own
+        (``_settle_positions_closed_at_broker``): what the record still
+        tracks is cancelled, what left the account is booked, the position
+        is cut to what is held or dropped, and the hold is lifted; the next
+        management pass places a stop for what is left.
+
+        It runs whatever ``runtime.startup_reconcile_mode`` is, with the
+        reconcile off too, and touches nothing else: no other position is
+        compared with the account, nothing is restored, no order is judged
+        foreign and no entry block is set or cleared. Handed to the whole
+        reconcile instead, as the first build did, the position stayed
+        held until a restart where the reconcile is off or in mode
+        ``ignore``, and in mode ``block`` the reconcile, run mid-session,
+        counted the bot's own open positions and blocked every entry for
+        the rest of the day.
+
+        The account's shares in the symbol are taken as the bot's own, as
+        the reconcile takes them: shares held there for another reason hide
+        what was sold, and nothing is booked.
+
+        False, with the position still held, when the account or the
+        working orders cannot be read, a cancel is not confirmed, the
+        position's entry order is still settling, or anything raises
+        (logged with its type): the engine tries again. A dry run hands
+        nothing over and reads nothing.
+
+        The positions settled are the ones held once the follow has run:
+        that follow can hand another one over (its REPLACED stop reached
+        the end of its minute), and the engine takes a True answer to mean
+        that none is held. Read before the follow, as the first build of
+        this did, that position was left out, the answer was still True,
+        and it stayed held with no exit and no stop until a broker
+        reconcile or a restart (the verifier's probe)."""
+        handed = self._held_for_settle()
+        if self.config.schwab.dry_run or not handed:
+            return True
+        try:
+            raw_positions = self.executor.fetch_account_positions()
+            if raw_positions is None:
+                raise RuntimeError("the broker account read failed")
+            now = sessions.now_et()
+            from_ts, to_ts = (
+                stamp.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                for stamp in (now - timedelta(days=self.config.runtime.startup_order_lookback_days), now))
+            raw_orders = self.executor.fetch_working_orders(from_ts, to_ts)
+            working_orders = None if raw_orders is None else self._filter_reconcile_orders(raw_orders)
+            # The other leg of a bracket may read REPLACED too: followed
+            # first, so the settle's cancel goes to the order that rests.
+            self._follow_replaced_children()
+            handed |= self._held_for_settle()
+            settled = self._settle_positions_closed_at_broker(
+                raw_positions, working_orders, set(self._unsettled_entry_order_ids()), only=handed)
+        except Exception as exc:
+            # The settle lifts a position's hold before it books and cuts
+            # it: one that raised in between is held again, or the next try
+            # would find nothing held and answer True for a position still
+            # counted at shares the account no longer holds (the safety
+            # review's probe).
+            for key in handed | self._held_for_settle():
+                if key in self.positions and isinstance(self.positions[key].metadata, dict):
+                    self.positions[key].metadata["settle_pending"] = True
+            LOG.error("The settle of %s against the broker account failed (%s: %s); held, and tried again",
+                      ", ".join(sorted(self._held_for_settle())), type(exc).__name__, exc, exc_info=exc)
+            return False
+        still_held = sorted(self._held_for_settle())
+        if still_held:
+            LOG.warning("%s: not settled against the broker account yet; held, and tried again",
+                        ", ".join(still_held))
+        return settled and not still_held
+
     def _settle_positions_closed_at_broker(self, raw_positions: list[dict[str, Any]],
                                            working_orders: list[dict[str, Any]] | None,
-                                           unsettled: set[str]) -> bool:
+                                           unsettled: set[str], *, only: set[str] | None = None) -> bool:
         """Stop managing what the broker no longer holds.
 
         The session-boundary re-run of ``reconcile`` exists for positions
@@ -1083,6 +1167,9 @@ class StartupReconciler:
         engine retries. A vertical whose legs are out of step is left tracked
         without failing the attempt: its rows were read, and a retry would
         read them the same.
+
+        With *only*, the positions of those keys are settled and no other
+        is looked at (``settle_handed_positions``).
         """
         if not self.positions or self.config.schwab.dry_run:
             return True
@@ -1090,6 +1177,8 @@ class StartupReconciler:
         changed = False
         settled = True
         for key, position in list(self.positions.items()):
+            if only is not None and key not in only:
+                continue
             if str(key).upper().strip() in unsettled:
                 LOG.warning("%s: its entry order is still settling; leaving it to the entry gatekeeper", key)
                 continue
@@ -1190,9 +1279,19 @@ class StartupReconciler:
                     fill_price_estimated=True,
                     broker_recovered=True,
                 )
+                changed = True
+                # Cut the moment the close is booked (2026-11-11): whatever
+                # raises from here on (the risk registration) fails the
+                # attempt, and a position still at its old size would have
+                # the same shares booked a second time by the retry.
+                if kept <= 0:
+                    self.positions.pop(key, None)
+                else:
+                    position.qty = kept
+                    if isinstance(position.metadata, dict):
+                        position.metadata["qty"] = kept
                 if float(realized) < 0:
                     self.risk.register_realized_pnl(float(realized))
-                changed = True
                 LOG.warning("%s: broker holds %s of %s; %s closed outside the bot, booked at the last mark %.4f "
                             "(estimated)", key, remaining, expected, closed_qty, exit_price)
             if kept <= 0:

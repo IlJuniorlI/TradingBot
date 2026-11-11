@@ -516,6 +516,14 @@ class IntradayBot:
         # (_maybe_session_reconcile).
         self._reconcile_after_sweeps = False
         self._last_reconcile_attempt_monotonic: float = 0.0
+        # Failed tries in a row at the settle of the positions the manager
+        # handed over, and when the last one ended (monotonic); see
+        # _maybe_settle_handed_positions.
+        self._handed_settle_failures = 0
+        self._last_handed_settle_monotonic: float = 0.0
+        # The positions still held after the last failed try: one handed
+        # over since is settled at once, not after the others' wait.
+        self._handed_settle_tried: frozenset[str] = frozenset()
         # The ended ET days this process still owes a close, oldest first
         # when closed: the SESSION REPORT summary, the append of its trades
         # to the persistent trades.csv and the day's archive (`_DayClose`).
@@ -625,6 +633,7 @@ class IntradayBot:
             account=self.account,
             strategy=self.strategy,
             positions=self.positions,
+            reconcile_metadata_store=self.reconcile_metadata_store,
             save_reconcile_metadata=self._save_reconcile_metadata,
         )
         self.startup_reconciler = StartupReconciler(
@@ -649,6 +658,10 @@ class IntradayBot:
         # The entry orders the last run left unsettled: tracked before the
         # startup reconcile, which settles them (2026-11-08).
         self.entry_gatekeeper.load_unsettled_entry_orders()
+        # So are the post-close sweeps it still owed: their symbols take no
+        # entry, and the exit orders they are after are cancelled, from
+        # this run's first pass on (2026-11-11).
+        self.position_manager.load_owed_sweeps()
         self.cycle_gate = CycleGate(
             config,
             positions=self.positions,
@@ -880,6 +893,7 @@ class IntradayBot:
                     self._maybe_log_refresh_token_window()
                     self._check_schwab_login(sessions.now_et())
                     self._maybe_session_reconcile()
+                    self._maybe_settle_handed_positions()
                     self.step()
                     self.last_error = None
                     consecutive_errors = 0
@@ -1230,13 +1244,15 @@ class IntradayBot:
         as a foreign order and, having succeeded, was not run again that
         day, so entries stayed blocked though the sweep cancelled the
         leftover a minute later. A sweep that never finishes keeps the
-        block: its order is still there.
+        block: its order is still there. The same holds while the sweeps
+        an earlier run saved could not be read
+        (``PositionManager.owed_sweeps_unread``): the order it blocked on
+        may be one of theirs, and it runs once more when they are read and
+        done.
 
-        The position manager asks for a run too (``reconcile_wanted``) when
-        it hands a position to the settle: a REPLACED stop left nothing
-        resting and shares were sold by orders the record cannot tell
-        apart, so only the account says what is held
-        (``PositionManager._replaced_child_gone``).
+        A position the manager hands to its settle is not this method's:
+        it is settled alone, in every mode
+        (``_maybe_settle_handed_positions``).
 
         Disable the new-day reconcile via `runtime.session_reconcile_on_resume: false`.
         """
@@ -1246,10 +1262,10 @@ class IntradayBot:
         if self.config.runtime.startup_reconcile_mode == "ignore":
             return
         retrying = self._reconcile_failures > 0
-        # A reconcile owed a second run by the post-close sweeps, or asked
-        # for by the position manager (a position handed to the settle).
-        swept = self._reconcile_after_sweeps and not self.position_manager.exit_sweep_symbols()
-        again = swept or self.position_manager.reconcile_wanted
+        # A reconcile owed a second run by the post-close sweeps: once none
+        # is owed, and the ones an earlier run saved have been read.
+        again = (self._reconcile_after_sweeps and not self.position_manager.exit_sweep_symbols()
+                 and not self.position_manager.owed_sweeps_unread)
         if not (retrying or again) and not self.config.runtime.session_reconcile_on_resume:
             return
         now = sessions.now_et()
@@ -1274,11 +1290,8 @@ class IntradayBot:
                 return
             LOG.info("Retrying the failed broker reconcile")
         elif again:
-            LOG.info("Broker reconcile again: %s",
-                     "it blocked entries on working orders while a post-close sweep was still owed, and the "
-                     "sweeps are done" if swept else
-                     "a position is held for its settle (a REPLACED stop left nothing resting, and shares were "
-                     "sold by orders the record does not track)")
+            LOG.info("Broker reconcile again: it blocked entries on working orders while a post-close sweep was "
+                     "still owed, and the sweeps are done")
         elif self._last_reconcile_session_date == today:
             return
         else:
@@ -1306,9 +1319,6 @@ class IntradayBot:
             self.startup_reconciler.restore_paper_positions()
             self._paper_restore_pending = False
         ok = self.startup_reconciler.reconcile()
-        # Asked for or not, the reconcile has run; a failed one is retried
-        # as any failed attempt is.
-        self.position_manager.reconcile_wanted = False
         # The retry delay runs from the END of the attempt, so an attempt that
         # hangs for longer than the delay is not re-fired at once.
         self._last_reconcile_attempt_monotonic = time.monotonic()
@@ -1316,9 +1326,11 @@ class IntradayBot:
             self._last_reconcile_session_date = session_date
             self._reconcile_failures = 0
             self._settle_hold_failures = 0
+            # Owed too while the sweeps an earlier run saved could not be
+            # read: the order it blocked on may be one of theirs.
             self._reconcile_after_sweeps = (
                 self.startup_reconciler.trading_blocked_reason == "working_orders_present"
-                and bool(self.position_manager.exit_sweep_symbols()))
+                and (bool(self.position_manager.exit_sweep_symbols()) or self.position_manager.owed_sweeps_unread))
             # The day's row's positions this reconcile did not restore leave
             # the row, each logged with the move it leaves in the day's P&L
             # (after the first success, there are none).
@@ -1334,6 +1346,68 @@ class IntradayBot:
         self._settle_hold_failures = self._settle_hold_failures + 1 if held else 0
         LOG.warning("Broker reconcile failed (%d in a row); retrying in %.0fs",
                     self._reconcile_failures, self._reconcile_retry_delay())
+
+    def _held_for_settle(self) -> frozenset[str]:
+        """The keys of the positions held for a settle against the account
+        (``settle_pending``)."""
+        return frozenset(key for key, position in self.positions.items()
+                         if isinstance(position.metadata, dict) and position.metadata.get("settle_pending"))
+
+    def _maybe_settle_handed_positions(self) -> None:
+        """Settle against the broker account the positions the manager
+        handed over (``PositionManager.settle_wanted``,
+        ``StartupReconciler.settle_handed_positions``), on the pass after
+        the hand-off, while the broker answers (the stream window of a
+        trading day) (2026-11-11).
+
+        The follow of a REPLACED stop hands a position over when nothing
+        entered after the stop can still rest and those orders sold shares
+        the record cannot book (``PositionManager._replaced_child_gone``).
+        The position is held, with no exit and no stop placed, until its
+        settle has compared it with the account, so this does not wait for
+        the broker reconcile and does not depend on it: it runs with the
+        reconcile off and in mode ``ignore`` too, for those positions
+        alone.
+
+        A try that fails (a read, a cancel not confirmed) is logged at
+        ERROR and tried again ``RECONCILE_SETTLE_RETRY_SECONDS`` after it
+        ends, then at a doubling interval capped at
+        ``RECONCILE_RETRY_MAX_SECONDS``; every
+        ``execution.disaster_stop_escalation_attempts``-th in a row logs
+        ``POSITION HELD FOR SETTLE`` at CRITICAL. The wait is the tries'
+        own, not a position's: a position handed over while another's
+        settle keeps failing is tried at once, and the wait goes on from
+        there for both. A dry run hands nothing over."""
+        if not self.position_manager.settle_wanted:
+            return
+        state = equity_session_state(
+            sessions.now_et(), extended_hours_enabled=bool(self.config.execution.extended_hours_enabled))
+        if not state.stream_available:
+            return
+        if self._handed_settle_failures and self._held_for_settle() <= self._handed_settle_tried:
+            delay = min(RECONCILE_RETRY_MAX_SECONDS,
+                        RECONCILE_SETTLE_RETRY_SECONDS * 2.0 ** min(self._handed_settle_failures - 1, 16))
+            if time.monotonic() - self._last_handed_settle_monotonic < delay:
+                return
+        settled = self.startup_reconciler.settle_handed_positions()
+        # The delay runs from the END of the try, as the reconcile's does.
+        self._last_handed_settle_monotonic = time.monotonic()
+        if settled:
+            self.position_manager.settle_wanted = False
+            self._handed_settle_failures = 0
+            self._handed_settle_tried = frozenset()
+            self._save_reconcile_metadata()
+            return
+        self._handed_settle_failures += 1
+        self._handed_settle_tried = self._held_for_settle()
+        held = sorted(self._handed_settle_tried)
+        LOG.error("The settle of %s against the broker account did not finish (%d in a row); held with no exit "
+                  "and no stop placed until it does", ", ".join(held) or "the handed position(s)",
+                  self._handed_settle_failures)
+        if self._handed_settle_failures % int(self.config.execution.disaster_stop_escalation_attempts) == 0:
+            LOG.critical("POSITION HELD FOR SETTLE — %s: %d consecutive tries at the settle against the broker "
+                         "account failed. No exit is sent and no stop is placed for it until one succeeds. Check "
+                         "the account.", ", ".join(held) or "the handed position(s)", self._handed_settle_failures)
 
     def _reconcile_retry_delay(self) -> float:
         if self._settle_hold_failures:

@@ -248,9 +248,16 @@ STOP_SOURCE_KEY = "stop_source"
 
 # The position metadata key of the price an equity position's disaster stop
 # rests at (execution.disaster_stop_enabled), stamped when the position is
-# opened or restored (``SchwabExecutor.stamp_disaster_stop_price``) and never
-# moved; EXIT_CONTEXT carries it.
+# opened or restored (``SchwabExecutor.stamp_disaster_stop_price``);
+# EXIT_CONTEXT carries it. The bot never moves it. A stop moved at the broker
+# (in the app) moves it to where the stop rests, so every later placement
+# keeps that price (``PositionManager._note_moved_backup_level``, 2026-11-11).
 DISASTER_STOP_PRICE_KEY = "disaster_stop_price"
+# The price the bot stamped, kept beside DISASTER_STOP_PRICE_KEY from the
+# first time a move at the broker changed that one; absent until then. A
+# moved price the market is through when a stop has to be placed gives way to
+# it (``PositionManager._drop_moved_level_if_through``).
+DISASTER_STOP_OWN_PRICE_KEY = "disaster_stop_own_price"
 
 
 def stop_exit_reason(meta: Mapping[str, Any] | None) -> str:

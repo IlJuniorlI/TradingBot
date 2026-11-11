@@ -64,7 +64,10 @@ from .models import (
 )
 from .numeric import first_float, safe_float
 from .paper_account import PaperAccount
+from .position_store import ReconcileMetadataStore
 from .position_metrics import (
+    DISASTER_STOP_OWN_PRICE_KEY,
+    DISASTER_STOP_PRICE_KEY,
     LADDER_TOUCH_HOLD_KEY,
     STOP_SOURCE_KEY,
     append_management_adjustment,
@@ -85,19 +88,23 @@ from .broker_payloads import (
     BRACKET_REPLACED_IDS_KEY,
     DISASTER_STOP_REASON,
     DISASTER_SYNC_MODE,
+    MOVED_STOP_ORDER_TYPES,
     ORDER_DEAD,
     ORDER_LIVE,
     ORDER_REPLACED,
+    STOP_ORDER_TYPES,
     WORKING_STATUSES,
     active_broker_bracket,
     add_booked_child_fill,
     booked_child_part,
     booked_fills_ledger,
     bracket_order_ids,
+    broker_position_side_qty,
     exit_orders,
     is_disaster_stop,
     listed_stop,
     note_replaced_order,
+    order_entered_at,
     order_may_be_live,
     order_result_needs_broker_recheck,
     order_row_filled_qty,
@@ -105,6 +112,7 @@ from .broker_payloads import (
     protective_stop_reason,
     replacement_order,
     sent_exit_stop,
+    sent_exit_stops,
     unbooked_fill_price,
     working_exit_outstanding_qty,
 )
@@ -212,6 +220,7 @@ class PositionManager:
         account: PaperAccount,
         strategy: BaseStrategy,
         positions: dict[str, Position],
+        reconcile_metadata_store: ReconcileMetadataStore | None,
         save_reconcile_metadata: Callable[[], None],
     ) -> None:
         self.config = config
@@ -226,6 +235,10 @@ class PositionManager:
         # The exit record's S/R snapshot failures (_position_exit_context).
         self._log_component_failure = ComponentFailureLog(LOG)
         self.positions = positions
+        # The state store, where the post-close sweeps still owed are saved
+        # (``_save_owed_sweeps``); None only in tests that build a manager
+        # with no store.
+        self.reconcile_metadata_store = reconcile_metadata_store
         self._save_reconcile_metadata = save_reconcile_metadata
         # Child id -> (monotonic time read, order state) for bracket children
         # the listing does not return; see _unlisted_bracket_child_state.
@@ -238,19 +251,30 @@ class PositionManager:
         self._looks: dict[str, _Look] = {}
         # Position key -> the post-close sweep still owed for a closed
         # position whose orders could not be read, or whose leftover exit
-        # orders' cancel is not confirmed; see _sweep_exit_orders.
+        # orders' cancel is not confirmed; see _sweep_exit_orders. Saved to
+        # the state store as it changes and tracked again by a restart
+        # (``_save_owed_sweeps``, ``load_owed_sweeps``).
         self._sweeps_owed: dict[str, dict[str, Any]] = {}
+        # The owed sweeps as the store holds them: what the last save wrote,
+        # or what the start-up's load read. Empty before either, so nothing
+        # is written until a sweep is owed.
+        self._owed_sweeps_saved: dict[str, dict[str, Any]] = {}
+        # When the store's owed sweeps could not be read (monotonic), None
+        # once they were: until then nothing is written over them, and the
+        # read is tried again (_try_owed_sweeps).
+        self._owed_sweeps_unread_since: float | None = None
         # By position key, the bracket children (their record keys) the
         # broker reconcile followed to a replacement and left to the next
         # management pass to size (follow_replaced_children): the reconcile
         # has not compared the position with the account by then.
         self._unsized: dict[str, set[str]] = {}
-        # A position was handed to the broker reconcile's settle (held with
-        # ``settle_pending``) by the follow of a REPLACED stop that found
-        # nothing left resting and shares sold by orders it cannot tell
-        # apart (_replaced_child_gone): the engine runs the reconcile on its
-        # next pass and clears this (IntradayBot._maybe_session_reconcile).
-        self.reconcile_wanted = False
+        # A position was handed to the settle against the account (held
+        # with ``settle_pending``) by the follow of a REPLACED stop that
+        # found nothing left resting and shares sold by orders it cannot
+        # tell apart (_replaced_child_gone): the engine settles it on its
+        # next pass and clears this once it is settled
+        # (IntradayBot._maybe_settle_handed_positions).
+        self.settle_wanted = False
         # When run_owed_sweeps last tried them (monotonic), None before.
         self._owed_sweeps_tried_at: float | None = None
         # Position key -> its recent spreads, the abnormal-book guard of a
@@ -1045,7 +1069,7 @@ class PositionManager:
                 state, why = self._follow_replaced_child(key, position, bracket, child_key, state, states, bars)
                 if key not in self.positions or state is None:
                     # Closed by the replaced order's own fills, or handed to
-                    # the broker reconcile's settle.
+                    # its settle against the account.
                     return
                 if why is None:
                     followed[child_key] = state
@@ -1220,6 +1244,7 @@ class PositionManager:
                 and bracket.pop("replacement_misses", None) is not None:
             self._save_reconcile_metadata()
         self._track_resting_levels(key, bracket, child_states)
+        self._note_moved_backup_level(key, position, bracket, child_states.get("stop_order_id"))
         if followed:
             self._size_followed_children(key, position, bracket, followed,
                                          str(position.metadata.get("underlying") or position.symbol))
@@ -1247,7 +1272,7 @@ class PositionManager:
         order the record tracks under *child_key* from here, and None when
         that is a replacement found, else why none was (it is still the
         REPLACED one). The state is None when the position was handed to
-        the broker reconcile's settle instead (``_replaced_child_gone``).
+        its settle against the account instead (``_replaced_child_gone``).
 
         Schwab does not edit an order: a stop moved in the app, or resized
         by the bot with an answer that carried no new id
@@ -1322,6 +1347,15 @@ class PositionManager:
                                f"not found ({how})")
             LOG.warning("Bracket %s %s for %s was REPLACED at the broker by order %s (%s), which is tracked in its "
                         "place", child, child_id, key, replacement_id, how)
+            kind = replacement_state.get("order_type")
+            if child == "stop" and kind and kind not in MOVED_STOP_ORDER_TYPES:
+                # Tracked as the stop all the same: an exit cancels it first
+                # and its fill is booked. But it stops nothing, and the log
+                # said nothing of it until 2026-11-11.
+                LOG.error("%s: its stop was changed at the broker into a %s order (%s), which is tracked in the "
+                          "stop's place: NO STOP RESTS AT THE BROKER for it while that order stands. If it has to "
+                          "be cut down it is re-issued as the bot's stop at %s", key, kind, replacement_id,
+                          bracket.get("stop_price"))
             note_replaced_order(bracket, child_id)
             bracket[child_key] = replacement_id
             if str(bracket.get("protective_order_id") or "") == child_id:
@@ -1388,18 +1422,21 @@ class PositionManager:
           has booked or will, so nothing is booked from them here. The
           record drops the order (``_drop_gone_child``) and stays active
           only for what else it tracks (a bracket's other leg, which the
-          settle cancels); the position is held for the broker reconcile's
-          settle (``settle_pending``), which compares it with the account,
+          settle cancels); the position is held for its settle against the
+          account (``settle_pending``), which compares it with the account,
           books what left it and lifts the hold, and the engine runs that
-          reconcile on its next pass (``reconcile_wanted``). The pass after
-          it places a stop for what is held.
-        - They sold shares and the broker reconcile is off
-          (``runtime.reconcile_on_startup`` false, or mode ``ignore``):
-          nothing would ever lift that hold, so the position is held as
-          one whose replacement is not found, and says so.
+          settle for it alone on its next pass (``settle_wanted``,
+          ``StartupReconciler.settle_handed_positions``), whatever
+          ``runtime.startup_reconcile_mode`` is. The pass after it places a
+          stop for what is held.
 
         Until then every such position was held with no exit and no stop
-        until a restart."""
+        until a restart. In the same day's first build the hand-off was to
+        the whole broker reconcile, which a run with the reconcile off or
+        in mode ``ignore`` never runs (the position stayed held, with no
+        exit, until a restart), and which in mode ``block`` counted the
+        bot's own open positions and blocked every entry for the rest of
+        the day."""
         child = "stop" if child_key == "stop_order_id" else "target"
         dead = {**state, "status": "CANCELED", "is_filled": False, "is_terminal_failure": True}
         bracket.pop("replacement_gone_since", None)
@@ -1407,12 +1444,6 @@ class PositionManager:
             LOG.warning("Bracket stop %s for %s was REPLACED at the broker and nothing entered after it can still "
                         "rest (every later exit order died unfilled); it is retired as a dead stop", child_id, key)
             return dead, None
-        runtime = self.config.runtime
-        if sold > 0 and (not runtime.reconcile_on_startup or runtime.startup_reconcile_mode == "ignore"):
-            return state, (f"its {child} order {child_id} was REPLACED at the broker and nothing entered after it "
-                           f"can still rest, but the order(s) entered after it sold {sold} share(s) the record "
-                           "cannot book, and the broker reconcile that would compare the position with the "
-                           "account is off")
         self._drop_gone_child(bracket, child_key, child_id)
         if sold <= 0:
             LOG.warning("Bracket target %s for %s was REPLACED at the broker and nothing entered after it can still "
@@ -1422,11 +1453,11 @@ class PositionManager:
             return dead, None
         bracket.pop("replacement_misses", None)
         position.metadata["settle_pending"] = True
-        self.reconcile_wanted = True
+        self.settle_wanted = True
         LOG.error("%s: its %s order %s was REPLACED at the broker and nothing entered after it can still rest, but "
                   "the order(s) entered after it sold %d share(s), and which of them replaced it is not known. "
-                  "Nothing is booked from them; the position is held for the broker reconcile, which compares it "
-                  "with the account", key, child, child_id, int(sold))
+                  "Nothing is booked from them; the position is held for its settle, which compares it with the "
+                  "account", key, child, child_id, int(sold))
         self._save_reconcile_metadata()
         return None, None
 
@@ -1539,11 +1570,13 @@ class PositionManager:
         if expected < 1:
             return
         if not wrong:
-            if right == len(followed) and bracket.get("qty") != expected:
+            if right == len(followed):
                 # What the record says rests is what does: the replacement
                 # holds what the original had left.
+                recorded = bracket.get("qty")
                 bracket["qty"] = expected
-                self._save_reconcile_metadata()
+                if self._clear_missized(bracket) or recorded != expected:
+                    self._save_reconcile_metadata()
             return
         resting = wrong[0][1]
         bracket["qty"] = resting
@@ -1573,6 +1606,7 @@ class PositionManager:
         if resized:
             LOG.warning("%s: the replacement followed was of another size than the %s share(s) it should cover "
                         "(%s); resized (%s)", key, expected, named, message)
+            self._clear_missized(bracket)
             self._save_reconcile_metadata()
             return
         bracket["state"] = missized
@@ -1584,6 +1618,128 @@ class PositionManager:
             return
         LOG.error("%s: %s -- a resting exit larger than the position would flip it on trigger", key, detail)
         self._save_reconcile_metadata()
+
+    @classmethod
+    def _clear_missized(cls, bracket: dict[str, Any]) -> bool:
+        """A disaster stop's record that read as resting another size
+        (``_DISASTER_STOP_MISSIZED_STATES``) rests the right one: it reads
+        ``adopted``, with no retry time, as ``ensure_disaster_stop`` leaves
+        one it resized. True when it did read so. Without this a record
+        marked while its position was held
+        (``late_fills_wait_for_replacement``) had ``ensure_disaster_stop``
+        send a second, identical resize in the pass that sized the
+        replacement."""
+        if not is_disaster_stop(bracket) or bracket.get("state") not in cls._DISASTER_STOP_MISSIZED_STATES:
+            return False
+        bracket["state"] = "adopted"
+        bracket.pop("attempted_at", None)
+        return True
+
+    def late_fills_wait_for_replacement(self, key: str, position: Position) -> bool:
+        """True when late entry fills grew *key* while it is held for a
+        protective order the broker lists REPLACED whose replacement is not
+        found (``_replacement_unresolved``): its resize is not sent
+        (``EntryGatekeeper._grow_position``, 2026-11-11). The record still
+        names the REPLACED order, and a replace sent to it is refused: an
+        ERROR, and for a disaster stop a miss toward ``DISASTER STOP
+        DEGRADED`` that no stop's failure earned.
+
+        A disaster stop's record reads ``qty_mismatch`` from here, with no
+        miss counted and no retry time: once the hold ends,
+        ``ensure_disaster_stop`` resizes the stop to the shares held on the
+        first pass, as it does after a refused resize
+        (``disaster_stop_resize_refused``). A bracket's children keep the
+        size they rest, as a refused resize leaves them, and that is logged
+        at ERROR."""
+        if not self._replacement_unresolved(position):
+            return False
+        record = position.metadata["bracket"]
+        if is_disaster_stop(record):
+            record["state"] = "qty_mismatch"
+            LOG.warning("Disaster stop for %s: late entry fills grew the position to %s while its stop reads "
+                        "REPLACED at the broker and the replacement is not found; no resize is sent to the "
+                        "replaced order, and the stop is resized once its replacement is tracked", key, position.qty)
+        else:
+            LOG.error("%s: late entry fills grew the position to %s while a protective order of its bracket reads "
+                      "REPLACED at the broker and the replacement is not found; no resize is sent to the replaced "
+                      "order, and its children rest the size they had", key, position.qty)
+        return True
+
+    def _note_moved_backup_level(self, key: str, position: Position, bracket: dict[str, Any],
+                                 stop_state: dict[str, Any] | None) -> None:
+        """Keep, as the position's backup level, the price its disaster
+        stop was moved to at the broker (2026-11-11).
+
+        The bot rests a disaster stop at the position's stamped price
+        (``DISASTER_STOP_PRICE_KEY``) and never moves it, so one the broker
+        lists working at another level was moved there by hand: in the app
+        while the bot ran (the record's level follows it,
+        ``_track_resting_levels``), or while it was down (a restore adopts
+        the stop as it rests). Until then only the record kept that level,
+        and every stop placed afresh (after a partial exit, a cancel, a
+        refused resize: ``ensure_disaster_stop``, ``_reprotect_remainder``,
+        the restore's re-protect) went back to the stamped price. The
+        stamped price is moved to it, the bot's own kept beside it
+        (``DISASTER_STOP_OWN_PRICE_KEY``) for a moved price the market is
+        through when a stop has to be placed
+        (``_drop_moved_level_if_through``); a stop moved back to the bot's
+        own level drops that key.
+
+        Only a plain stop that is working and whose level reads: a
+        trailing stop's level moves by itself, an order of another kind
+        has none, and a filled or dead one is the booking's or the
+        retire's. A bracket's stop follows the engine's level and is not
+        touched."""
+        if not is_disaster_stop(bracket) or not isinstance(stop_state, dict) or not isinstance(position.metadata, dict):
+            return
+        if stop_state.get("is_filled") or stop_state.get("is_terminal_failure") \
+                or stop_state.get("order_type") not in STOP_ORDER_TYPES:
+            return
+        resting = safe_float(stop_state.get("stop_price"), None, finite=True)
+        stamped = safe_float(position.metadata.get(DISASTER_STOP_PRICE_KEY), None, finite=True)
+        if resting is None or resting <= 0 or stamped is None:
+            return
+        if abs(resting - self.executor.protective_stop_level(position.side, stamped)) < 1e-9:
+            return
+        own = safe_float(position.metadata.get(DISASTER_STOP_OWN_PRICE_KEY), stamped, finite=True)
+        position.metadata[DISASTER_STOP_PRICE_KEY] = resting
+        if abs(resting - self.executor.protective_stop_level(position.side, own)) < 1e-9:
+            position.metadata.pop(DISASTER_STOP_OWN_PRICE_KEY, None)
+            LOG.warning("Disaster stop for %s rests at %s, the bot's own level again; that is its backup level",
+                        key, resting)
+        else:
+            position.metadata[DISASTER_STOP_OWN_PRICE_KEY] = own
+            LOG.warning("Disaster stop for %s rests at %s at the broker, not at the bot's own level %s (moved in "
+                        "the app, or adopted where an earlier run left it); a stop placed afresh for it rests at %s "
+                        "from here", key, resting, own, resting)
+        self._save_reconcile_metadata()
+
+    def _drop_moved_level_if_through(self, position: Position) -> None:
+        """Before a disaster stop is placed afresh: give up a backup
+        level moved at the broker (``_note_moved_backup_level``) that the
+        last price is already through, for the bot's own, from here on
+        (2026-11-11).
+
+        A moved level can sit closer to the market than the bot's own. A
+        stop sent at a level the price is through is refused by the
+        broker, or sells at once; the bot's own level, further away, still
+        rests. The price is the paper account's last mark for the symbol,
+        which each management pass sets; with none, the moved level stands
+        and the broker answers. The caller saves: the placement that
+        follows writes the record before it sends anything."""
+        meta = position.metadata if isinstance(position.metadata, dict) else {}
+        own = safe_float(meta.get(DISASTER_STOP_OWN_PRICE_KEY), None, finite=True)
+        moved = safe_float(meta.get(DISASTER_STOP_PRICE_KEY), None, finite=True)
+        mark = safe_float(self.account.last_prices.get(position.symbol), None, finite=True)
+        if own is None or moved is None or mark is None or mark <= 0:
+            return
+        if (mark > moved) if position.side == Side.LONG else (mark < moved):
+            return
+        meta[DISASTER_STOP_PRICE_KEY] = own
+        del meta[DISASTER_STOP_OWN_PRICE_KEY]
+        LOG.warning("Disaster stop for %s: the last price %s is through the level it was moved to at the broker "
+                    "(%s); a stop placed for it rests at the bot's own level %s from here", position.symbol, mark,
+                    moved, own)
 
     @staticmethod
     def _replacement_unresolved(position: Position) -> bool:
@@ -1632,7 +1788,10 @@ class PositionManager:
         order list its re-protect needs), so the position is held as it was.
         Until its retry settles it, nothing is sent for it: an exit or a
         re-protect would be sized to shares the broker no longer holds
-        (2026-09-25)."""
+        (2026-09-25). So is a position the follow of a REPLACED stop handed
+        to its settle (``_replaced_child_gone``): shares were sold by
+        orders the record cannot book, and only the account says what is
+        held."""
         return bool(position.metadata.get("settle_pending")) if isinstance(position.metadata, dict) else False
 
     def _unlisted_bracket_child_state(self, child_id: str) -> dict[str, Any] | None:
@@ -1918,7 +2077,11 @@ class PositionManager:
         same way since 2026-09-25), or a full-size one a resize could not
         shrink -- is adopted and resized to ``qty``. Submitting fresh beside
         it orphaned the old OCO, and both sold when the stop traded
-        (2026-09-24)."""
+        (2026-09-24). With none to adopt, a backup level moved at the
+        broker that the last price is through gives way to the bot's own
+        first (``_drop_moved_level_if_through``)."""
+        if active_broker_bracket(position) is None:
+            self._drop_moved_level_if_through(position)
         reprotected = self.executor.ensure_position_protected(
             str(position.metadata.get("underlying") or position.symbol),
             int(position.qty) if qty is None else int(qty), position.side,
@@ -2098,6 +2261,10 @@ class PositionManager:
             missed = self._count_disaster_stop_down(
                 key, record, now, f"its disaster stop is down ({state}) with no exit working", retry=False,
             )
+        if known is None:
+            # A stop goes in afresh: at the level it was moved to at the
+            # broker, unless the last price is through that one.
+            self._drop_moved_level_if_through(position)
         level = self.executor.protective_stop_level(position.side, self.executor.resting_stop_price(position))
         position.metadata["bracket"] = {
             "parent_order_id": None, "sync_mode": DISASTER_SYNC_MODE, "legs": "stop_only", "session": "NORMAL",
@@ -2307,6 +2474,13 @@ class PositionManager:
         if count % int(self.config.execution.disaster_stop_escalation_attempts) == 0:
             LOG.critical("DISASTER STOP DEGRADED — %s: %d consecutive attempts missed. Last: %s", key, count, detail)
 
+    @property
+    def owed_sweeps_unread(self) -> bool:
+        """True while the post-close sweeps an earlier run saved could not
+        be read (``load_owed_sweeps``): which symbols still owe one is not
+        known yet. The read is tried again once a minute."""
+        return self._owed_sweeps_unread_since is not None
+
     def exit_sweep_owed(self, symbol: str) -> bool:
         """True while a closed position in *symbol* still owes its post-close
         sweep (``_sweep_exit_orders``): the entry gatekeeper opens nothing in
@@ -2346,7 +2520,7 @@ class PositionManager:
         of each broker reconcile (not paced): the reconcile of a new day
         would otherwise read the leftover as a foreign order and block the
         day's entries, minutes before the sweep cancelled it."""
-        if not (self._sweeps_owed and self.config.active_holds_across_sessions):
+        if not ((self._sweeps_owed or self.owed_sweeps_unread) and self.config.active_holds_across_sessions):
             return
         if not sessions.equity_session_state(
                 now, extended_hours_enabled=bool(self.config.execution.extended_hours_enabled)).stream_available:
@@ -2355,8 +2529,257 @@ class PositionManager:
         if paced and tried_at is not None and time.monotonic() - tried_at < OWED_SWEEP_RETRY_SECONDS:
             return
         self._owed_sweeps_tried_at = time.monotonic()
+        self._try_owed_sweeps()
+
+    def _try_owed_sweeps(self) -> None:
+        """Try every post-close sweep still owed (``_run_exit_sweep``), then
+        save what is owed when it changed (``_save_owed_sweeps``). A store
+        whose owed sweeps could not be read at start-up is read again
+        first, once every ``OWED_SWEEP_RETRY_SECONDS``."""
+        unread = self._owed_sweeps_unread_since
+        if unread is not None and time.monotonic() - unread >= OWED_SWEEP_RETRY_SECONDS:
+            self.load_owed_sweeps()
         for key in list(self._sweeps_owed):
             self._run_exit_sweep(key)
+        self._save_owed_sweeps()
+
+    @staticmethod
+    def _serialize_owed_sweep(owed: dict[str, Any]) -> dict[str, Any]:
+        """An owed sweep as the state store keeps it: what a restart needs
+        to run it again. The consecutive-miss count and the wait of a
+        loaded one are this run's and are not kept."""
+        sent = owed["sent"]
+        return {
+            "symbol": str(owed["symbol"]), "side": owed["side"].value,
+            "sent": None if sent is None else {**sent, "sent_at": sent["sent_at"].isoformat()},
+            "reported": sorted(str(oid) for oid in owed["reported"]),
+            "fills_logged": int(owed.get("fills_logged") or 0), "owed_at": owed.get("owed_at"),
+        }
+
+    @staticmethod
+    def _deserialize_owed_sweep(raw: Any) -> dict[str, Any]:
+        """The owed sweep a saved row (``_serialize_owed_sweep``) stands
+        for, marked ``loaded``: it was owed by an earlier run
+        (``_loaded_sweep_refusal``). Raises on a row that does not read:
+        one whose JSON did not parse (the store hands its text back,
+        ``ReconcileMetadataStore.load_owed_sweeps``), one that is no
+        record, or one that lacks a field."""
+        if not isinstance(raw, dict):
+            raise ValueError(f"not a saved record: {str(raw)[:60]!r}")
+        sent = raw["sent"]
+        if sent is not None:
+            sent = {"stop_price": sent["stop_price"], "qty": sent["qty"],
+                    "sent_at": datetime.fromisoformat(str(sent["sent_at"])),
+                    "booked": {str(oid): int(qty) for oid, qty in (sent.get("booked") or {}).items()}}
+        return {"symbol": str(raw["symbol"]), "side": Side(str(raw["side"])), "sent": sent, "misses": 0,
+                "reported": {str(oid) for oid in raw["reported"]}, "fills_logged": int(raw["fills_logged"]),
+                "owed_at": raw["owed_at"], "loaded": True}
+
+    def _save_owed_sweeps(self) -> None:
+        """Save the post-close sweeps still owed as they stand (every row
+        replaced), when they differ from what the store holds
+        (2026-11-11). Until then they lived in memory only and a restart
+        forgot them: the leftover order then blocked every entry as a
+        foreign order until it was cancelled by hand (the startup reconcile
+        in mode ``block`` or a restore mode, which a live disaster stop
+        requires), or rested unseen with the symbol open to entries beside
+        it (mode ``ignore`` or the reconcile off, which a live run can have
+        with bracket orders).
+
+        A close whose sweep is done at once writes nothing. A save that
+        fails is logged with its type and the next call tries again: the
+        close that owes the sweep must not fail on it. A dry run owes no
+        sweep and writes nothing: the rows the store holds are a live
+        run's. Nothing is written either while the rows an earlier run
+        saved could not be read (``load_owed_sweeps``): a save replaces
+        every row, and written after one failed read it erased sweeps that
+        run still owed (the safety review's probe)."""
+        if self.reconcile_metadata_store is None or self.config.schwab.dry_run \
+                or self._owed_sweeps_unread_since is not None:
+            return
+        rows = {key: self._serialize_owed_sweep(owed) for key, owed in self._sweeps_owed.items()}
+        if rows == self._owed_sweeps_saved:
+            return
+        try:
+            self.reconcile_metadata_store.save_owed_sweeps(rows)
+        except Exception as exc:
+            LOG.error("Could not save the %d post-close sweep(s) still owed (%s: %s); a restart before the next "
+                      "save would not know of them", len(rows), type(exc).__name__, exc)
+            return
+        self._owed_sweeps_saved = rows
+
+    def load_owed_sweeps(self) -> None:
+        """At start-up, before the startup reconcile: owe again the
+        post-close sweeps the last run still owed (saved by
+        ``_save_owed_sweeps``), so the exit orders a closed position left
+        working are cancelled by this run and their symbols take no entry
+        until they are (2026-11-11). Each is marked ``loaded``: it cancels
+        nothing beside shares the bot does not track
+        (``_loaded_sweep_refusal``).
+
+        A row that does not read is logged with its type and not owed. A
+        store that cannot be read owes none for now, at ERROR with the
+        type: it is read again once a minute from the passes that try the
+        owed sweeps (``_try_owed_sweeps``), nothing is written over it
+        meanwhile, and in mode ``block`` and the restore modes the startup
+        reconcile's own read of the working orders still blocks entries on
+        a leftover. A sweep this run already owes under a saved row's key
+        stands, marked ``loaded`` as that row was. A
+        dry run sweeps nothing and cannot cancel an order: the rows are a
+        live run's (the store is shared) and stay for it.
+
+        A sweep of a strategy that is flat by the close, saved on an
+        earlier day, is done at its first try: it reads the day's orders
+        (``SchwabExecutor.resting_stop_orders``), and its leftover was a
+        DAY order."""
+        if self.reconcile_metadata_store is None:
+            return
+        try:
+            rows = self.reconcile_metadata_store.load_owed_sweeps()
+        except Exception as exc:
+            LOG.error("Could not read the post-close sweeps the last run still owed (%s: %s); none is owed. An exit "
+                      "order a closed position left working is still seen by the startup reconcile's read of the "
+                      "working orders, where that reconcile is on", type(exc).__name__, exc)
+            if not self.config.schwab.dry_run:
+                # Read again a minute on, and nothing written until then.
+                self._owed_sweeps_unread_since = time.monotonic()
+            return
+        self._owed_sweeps_unread_since = None
+        if not rows:
+            return
+        if self.config.schwab.dry_run:
+            LOG.warning("%d post-close sweep(s) a live run still owed (%s) are not run by this dry run, which "
+                        "cancels no order; they stay in the store for the next live run", len(rows),
+                        ", ".join(sorted(rows)))
+            return
+        self._owed_sweeps_saved = rows
+        for key, raw in rows.items():
+            try:
+                owed = self._deserialize_owed_sweep(raw)
+            except Exception as exc:
+                LOG.error("The post-close sweep the last run still owed for %s cannot be read (%s: %s); it is not "
+                          "owed", key, type(exc).__name__, exc)
+                continue
+            if str(key) in self._sweeps_owed:
+                # Owed by this run too (the rows were read late): its own
+                # stands, and reads the account as the saved one would.
+                self._sweeps_owed[str(key)]["loaded"] = True
+                continue
+            self._sweeps_owed[str(key)] = owed
+            LOG.warning("%s closed in the last run with its post-close sweep on %s still owed (since %s); it is "
+                        "tried again, and entries in %s wait until it is done", key, owed["symbol"],
+                        owed["owed_at"], owed["symbol"])
+        self._save_owed_sweeps()
+
+    def _unconfirmed_stops_spared(self, key: str, owed: dict[str, Any], orders: list[dict[str, Any]], symbol: str,
+                                  side: Side) -> set[str]:
+        """The ids, among *orders* (the sweep's read, whatever their
+        status), of the exit stops that may still work and that a
+        post-close sweep (*key*'s, *owed*) must not cancel because an open
+        *side* position in *symbol* may own them: its disaster stop record
+        is ``unconfirmed`` (sent with an unknown outcome, or left so by a
+        restore that could not re-establish it), names no order, and so
+        cannot shield its stop through ``_tracked_order_ids`` (2026-11-11).
+
+        The orders that fit the record are the exit ``STOP`` orders at
+        exactly the price and the size it sent
+        (``broker_payloads.sent_exit_stops``). Spared among them, the ones
+        the record's own path can still take:
+
+        - When one of them was entered from the record's submit on
+          (``sent_at`` less ``DISASTER_STOP_RETRY_SECONDS``, the window
+          ``_look_up_unconfirmed_stop`` reads) and may still work or reads
+          REPLACED: that is the stop the record sent, which its lookup
+          adopts or follows, and only those entered in that window are
+          spared. An older one at the same price and size is a leftover:
+          the lookup never sees it, so spared it rested untracked for as
+          long as the record stayed unresolved (the third check's probe).
+        - Otherwise (none entered since the submit, or only ones that
+          filled or died): the submit did not land or its stop is gone, or
+          the record is a restore's, stamped at the restart, whose stop
+          rests from before it. The lookup then answers that nothing of
+          its stop rests, and the placement that follows adopts a stop
+          still resting on the symbol
+          (``SchwabExecutor.ensure_position_protected``), so every one that
+          fits is spared, whenever it was entered. With a resend rejected
+          at the restart counted as the record's own, the restored
+          position's real stop was cancelled (the fourth check's probe).
+
+        Cancelled, such a stop left the position resting none until one
+        was placed again (the safety review's probe). Every other exit
+        order is still a leftover and is cancelled: sparing the whole
+        symbol, as the first fix did, left a larger leftover resting beside
+        the position for as long as the record stayed unresolved (the
+        second check's probes). The sweep stays owed while any is spared,
+        and says so once. A submit time or an entry time that does not
+        read rules nothing out."""
+        wanted = str(symbol).upper().strip()
+        spared: set[str] = set()
+        owners: list[str] = []
+        for position_key, position in self.positions.items():
+            metadata = position.metadata if isinstance(position.metadata, dict) else {}
+            if position.side != side or not self._disaster_stop_unconfirmed(position) \
+                    or str(metadata.get("underlying") or position.symbol).upper().strip() != wanted:
+                continue
+            record = metadata["bracket"]
+            fits = sent_exit_stops(orders, symbol, side, stop_price=record.get("stop_price"), qty=record.get("qty"))
+            try:
+                since = datetime.fromisoformat(str(record.get("sent_at"))) - timedelta(seconds=DISASTER_STOP_RETRY_SECONDS)
+            except ValueError:
+                since = None
+            recent = [order for order in fits
+                      if since is None or order_entered_at(order) is None or order_entered_at(order) >= since]
+            own = any(order_status_class(order["status"]) in (ORDER_LIVE, ORDER_REPLACED) for order in recent)
+            fits = [order for order in (recent if own else fits) if order_may_be_live(order["status"])]
+            if fits:
+                owners.append(position_key)
+                spared |= {str(order["orderId"]) for order in fits}
+        if not spared:
+            owed.pop("spares", None)
+        elif owed.get("spares") != sorted(spared):
+            owed["spares"] = sorted(spared)
+            LOG.warning("%s closed with exit order(s) %s still working on %s at the price and size the disaster stop "
+                        "of %s was sent with an unknown outcome: they may be its stop, so they are left for its "
+                        "lookup, and the sweep stays owed until its record is settled", key,
+                        ", ".join(sorted(spared)), symbol, ", ".join(owners))
+        return spared
+
+    def _loaded_sweep_refusal(self, symbol: str, side: Side) -> str | None:
+        """Why a sweep an earlier run owed (``load_owed_sweeps``) may not
+        cancel the exit orders it found on *symbol* for *side*, or None
+        when it may: one read of the account.
+
+        A running bot's sweep never cancels an order an open position
+        tracks (``_tracked_order_ids``), so a position opened in the symbol
+        while the sweep was owed (an unsettled entry order's late fill)
+        keeps its stop. After a restart that position may not be tracked:
+        mode ``block`` restores nothing, mode ``ignore`` (and the reconcile
+        off) drops every position, and a restore has not run before the
+        first reconcile succeeds. Its stop then reads as a leftover, and
+        cancelling it would strip the only stop of shares the account
+        holds. So while the account holds
+        shares of the symbol on that side beyond the ones the bot tracks,
+        or cannot be read, nothing is cancelled."""
+        rows = self.executor.fetch_account_positions()
+        if rows is None:
+            return "the account could not be read"
+        wanted = str(symbol).upper().strip()
+        row = next((row for row in rows if str(row.get("symbol") or "").upper().strip() == wanted), None)
+        held_side, held = broker_position_side_qty(row)
+        if held is None:
+            return f"the account's row for {wanted} holds a quantity that cannot be read"
+        if held_side != side:
+            return None
+        tracked = 0
+        for position in self.positions.values():
+            metadata = position.metadata if isinstance(position.metadata, dict) else {}
+            if position.side == side and not is_option_asset(metadata) \
+                    and str(metadata.get("underlying") or position.symbol).upper().strip() == wanted:
+                tracked += int(position.qty)
+        if held > tracked:
+            return (f"the account holds {held} {side.value} share(s) of {wanted}, {held - tracked} more than the "
+                    f"bot tracks")
+        return None
 
     def _sweep_exit_orders(self, key: str, position: Position) -> None:
         """After a full close of a position that had live broker protection,
@@ -2396,13 +2819,24 @@ class PositionManager:
                 or is_option_asset(position.metadata)):
             return
         sent = None
+        earlier = self._sweeps_owed.get(key)
         if is_disaster_stop(record) and record.get("state") == "unconfirmed":
             sent = {"stop_price": record.get("stop_price"), "qty": record.get("qty"),
                     "sent_at": datetime.fromisoformat(str(record["sent_at"])),
                     "booked": {str(oid): int(qty) for oid, qty in (record.get("booked_child_fills") or {}).items()}}
         self._sweeps_owed[key] = {"symbol": str(position.metadata.get("underlying") or position.symbol),
-                                  "side": position.side, "sent": sent, "misses": 0, "reported": set()}
+                                  "side": position.side, "sent": sent, "misses": 0, "reported": set(),
+                                  "owed_at": sessions.now_et().isoformat()}
+        if (earlier or {}).get("loaded"):
+            # The sweep an earlier run owed on this symbol is still owed:
+            # this one takes its place and its look at the account. Without
+            # the mark, a position that opened and closed here after a
+            # restart let its sweep cancel the stop of shares the bot does
+            # not track, which the loaded one was refusing to (the safety
+            # review's probe).
+            self._sweeps_owed[key]["loaded"] = True
         self._run_exit_sweep(key)
+        self._save_owed_sweeps()
 
     def _run_exit_sweep(self, key: str) -> None:
         """Run *key*'s owed post-close sweep (``_sweep_exit_orders``). One
@@ -2431,8 +2865,14 @@ class PositionManager:
         working exit order) is never cancelled: a position opened in the
         symbol while the sweep was owed (an unsettled entry order's late
         fill) had its disaster stop cancelled on every pass until the sweep
-        ended, and rested none (2026-09-29)."""
+        ended, and rested none (2026-09-29). A sweep an earlier run owed
+        (``load_owed_sweeps``) reads the account before it cancels, and
+        cancels nothing beside shares the bot does not track
+        (``_loaded_sweep_refusal``); it then waits
+        ``OWED_SWEEP_RETRY_SECONDS`` before its next try."""
         owed = self._sweeps_owed[key]
+        if owed.get("wait_until") is not None and time.monotonic() < owed["wait_until"]:
+            return
         symbol, side, sent = owed["symbol"], owed["side"], owed["sent"]
         orders = self.executor.resting_stop_orders()
         sent_orders: list[dict[str, Any]] | None = []
@@ -2453,15 +2893,34 @@ class PositionManager:
         if sent is not None:
             self._report_sent_stop_fills(key, owed, sent_orders)
         tracked = self._tracked_order_ids()
-        left = [order for order in exit_orders([order for order in orders if order_may_be_live(order["status"])],
-                                               symbol, side)
-                if str(order["orderId"]) not in tracked]
+        live = [order for order in orders if order_may_be_live(order["status"])]
+        # The stops an open position's unconfirmed record may have resting
+        # are that position's, not leftovers; the sweep stays owed for them.
+        spared = self._unconfirmed_stops_spared(key, owed, orders, symbol, side)
+        left = [order for order in exit_orders(live, symbol, side)
+                if str(order["orderId"]) not in tracked and str(order["orderId"]) not in spared]
         if not left:
             owed["misses"] = 0
-            if settled:
+            if settled and not spared:
                 del self._sweeps_owed[key]
             return
         ids = [str(order["orderId"]) for order in left]
+        if owed.get("loaded"):
+            refusal = self._loaded_sweep_refusal(symbol, side)
+            if refusal is not None:
+                owed["misses"] += 1
+                owed["wait_until"] = time.monotonic() + OWED_SWEEP_RETRY_SECONDS
+                LOG.error("%s closed in an earlier run with exit order(s) %s still working on %s, and %s: they are "
+                          "left as they are, since one may be the stop of shares the bot does not track (%d "
+                          "consecutive time(s)). Tried again in %.0f s; entries in %s wait until then", key,
+                          ", ".join(ids), symbol, refusal, owed["misses"], OWED_SWEEP_RETRY_SECONDS, symbol)
+                if owed["misses"] % int(self.config.execution.disaster_stop_escalation_attempts) == 0:
+                    LOG.critical("EXIT ORDERS LEFT — %s closed in an earlier run, exit order(s) %s still work on "
+                                 "%s, and %s (%d consecutive times). Nothing is cancelled. Check the account: "
+                                 "close or cancel what is not the bot's; entries in %s wait until then.", key,
+                                 ", ".join(ids), symbol, refusal, owed["misses"], symbol)
+                return
+            owed.pop("wait_until", None)
         LOG.warning("%s closed with exit order(s) %s still working on %s; cancelling them", key, ", ".join(
             f"{order['orderId']} ({order.get('orderType')} {order.get('quantity')} at "
             f"{order.get('stopPrice')}, {order.get('status') or 'no status'})" for order in left), symbol)
@@ -2488,7 +2947,7 @@ class PositionManager:
                              symbol)
             return
         owed["misses"] = 0
-        if settled:
+        if settled and not spared:
             del self._sweeps_owed[key]
 
     def _tracked_order_ids(self) -> set[str]:
@@ -2813,8 +3272,7 @@ class PositionManager:
         ``_sweep_exit_orders``) is tried again first.
         """
         reprice_deadline = self.executor.exit_reprice_deadline()
-        for key in list(self._sweeps_owed):
-            self._run_exit_sweep(key)
+        self._try_owed_sweeps()
         # Book any exit the broker already executed BEFORE evaluating anything.
         # A filled resting child means the position is gone at the broker, and
         # managing or exiting a phantom position sends a duplicate order that
@@ -2904,7 +3362,7 @@ class PositionManager:
         if self._settle_pending(position):
             self.audit.log_cycle(
                 f"exit_gate:{key}", "settle_pending",
-                f"Exit held {key}: the broker reconcile could not confirm its bracket down; retrying",
+                f"Exit held {key}: it waits for its settle against the broker account; retrying",
                 interval=60.0, level=TRADEFLOW_LEVEL,
             )
             return

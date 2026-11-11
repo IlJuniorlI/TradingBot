@@ -1148,7 +1148,10 @@ class EntryGatekeeper:
                 self._stamp_entry_slippage(position.metadata, position_key, position.side, float(touch),
                                            float(position.metadata["entry_limit_price"]), float(position.entry_price))
             bracket = active_broker_bracket(position)
-            if bracket is not None:
+            # No resize while the record tracks an order the broker lists
+            # REPLACED whose replacement is not found: sent to that order it
+            # is refused (PositionManager.late_fills_wait_for_replacement).
+            if bracket is not None and not self.position_manager.late_fills_wait_for_replacement(position_key, position):
                 resized, msg = self.executor.resize_bracket_children(
                     bracket, str(position.metadata.get("underlying") or position.symbol), position.side,
                     total_qty, str(bracket.get("session") or "NORMAL"), initial_risk=initial_risk_per_unit(position),

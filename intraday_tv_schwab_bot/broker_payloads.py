@@ -778,18 +778,29 @@ def sent_exit_stop(orders: list[dict[str, Any]], symbol: Any, side: Side, *,
     working orders were read, so a stop that landed and filled before the
     lookup was never booked and another was placed for shares already
     sold."""
+    matches = sent_exit_stops(orders, symbol, side, stop_price=stop_price, qty=qty)
+    live = [order for order in matches if order_may_be_live(order.get("status"))]
+    filled = [order for order in matches if int(order.get("filledQuantity") or 0) > 0]
+    return (live or filled or matches or [None])[0]
+
+
+def sent_exit_stops(orders: list[dict[str, Any]], symbol: Any, side: Side, *,
+                    stop_price: Any, qty: Any) -> list[dict[str, Any]]:
+    """Every ``extract_orders`` row among *orders* that fits the stop an
+    order write sent (``sent_exit_stop``'s rule): an exit ``STOP`` on
+    *symbol* for a *side* position at exactly *stop_price* for exactly
+    *qty* shares, whatever its status. None when the price or the quantity
+    is not known. The post-close sweep spares these while the record that
+    sent them is still unconfirmed (``PositionManager._run_exit_sweep``)."""
     level = safe_float(stop_price, None, finite=True)
     shares = safe_int(qty)
     if level is None or shares is None:
-        return None
-    matches = [
+        return []
+    return [
         order for order in exit_orders(orders, symbol, side, order_types=frozenset({"STOP"}))
         if order.get("stopPrice") is not None and abs(float(order["stopPrice"]) - level) < 5e-5
         and order.get("quantity") == shares
     ]
-    live = [order for order in matches if order_may_be_live(order.get("status"))]
-    filled = [order for order in matches if int(order.get("filledQuantity") or 0) > 0]
-    return (live or filled or matches or [None])[0]
 
 
 def order_row_filled_qty(order: dict[str, Any]) -> int:
