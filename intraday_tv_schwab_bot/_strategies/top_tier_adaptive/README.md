@@ -672,7 +672,7 @@ That silently removed both mean-reversion regimes. `range` only enters within th
 
 The vote now gates per (side, regime) against `SIDE_DECISION_REGIMES`, matching the exemptions the index and confirmation-bar gates already made for `MEAN_REVERSION_REGIMES`. New skip reason: `<side>_build_failed_<regime>_side_decision_opposed(decided=...)`.
 
-**The vote's outcome is on every candidate decision** (2026-11-08): `side_vote` in a skip's details (the `SKIP_SUMMARY` record: `LONG` / `SHORT`, `undecided`, or `off` when the vote did not run, the knob off or the ORB bypass) and `gate_side_vote` in a signal's metadata (its `ENTRY_CONTEXT`). Until then the decided side reached no record but a `side_undecided` / `side_decision_opposed` refusal, so the vote's accuracy could not be measured: the per-regime scorecard of 2026-11-08 (`/pvr/claude/regime_scorecard`) could only read the sides it refused, which moved at chance over the next 30 minutes (trend +0 / -4 points, pullback +3 / -2).
+**The vote's outcome is on every candidate decision** (2026-11-08): `side_vote` in a skip's details (the `SKIP_SUMMARY` record: `LONG` / `SHORT`, `undecided`, or `off` when the vote did not run, the knob off or the ORB bypass) and `gate_side_vote` in a signal's metadata (its `ENTRY_CONTEXT`). Until then the decided side reached no record but a `side_undecided` / `side_decision_opposed` refusal, so the vote's accuracy could not be measured: the per-regime scorecard of 2026-11-08 (an offline script, not part of this repository) could only read the sides it refused, which moved at chance over the next 30 minutes (trend +0 / -4 points, pullback +3 / -2).
 
 ## 22. Long / short asymmetry (2026-09-18)
 

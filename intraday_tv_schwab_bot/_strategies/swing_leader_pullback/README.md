@@ -14,7 +14,7 @@ A daily-bar swing strategy: it buys a short pullback in a momentum leader at the
 
 ## Where it comes from
 
-The 2026-11-10 swing study (`/pvr/claude/newstrat`, written up in `.preview/swing_study_2026-11-10.md`). The rule was written down before it was run, and tested on the 494 index members outside the 25 top_tier names, on Yahoo daily bars 2006-2026, costs 5 bps a round trip:
+The 2026-11-10 swing study (an offline study; its scripts and write-up are not part of this repository). The rule was written down before it was run, and tested on the 494 index members outside the 25 top_tier names, on Yahoo daily bars 2006-2026, costs 5 bps a round trip:
 
 - no stop: 9,032 trades, 68% winners, +0.58% a trade after costs over about 4 sessions; +0.25% a trade over the equal-weight universe on the same days (monthly t 3.7); +0.22% over the same name bought on a random day in the same trend state (t 3.5);
 - with this strategy's 2 x ATR stop (every leader, 11,363 trades): 19% stopped, 67% winners, +0.44% a trade, +0.18% over the universe (t 3.2), the worst trade -29%;

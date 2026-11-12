@@ -1220,8 +1220,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Which bot: the script finds the bot of its checkout in /proc (a
     process of this user running the checkout's `main.py` from any working
     folder, or the `intraday-tv-schwab-bot` console script working in the
-    checkout) and says so (`The bot of /my-files/TradingBot running: pid
-    ..., working in /my-files/TradingBot (--config
+    checkout) and says so (`The bot of /path/to/TradingBot running: pid
+    ..., working in /path/to/TradingBot (--config
     configs/config.top_tier_adaptive.yaml, no --env).`). It takes its
     `--config` and `--env`, read with the bot's own parser
     (`cli.argument_parser`), and reads them, the `.env` and a relative
@@ -1327,8 +1327,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     full path with the `--config` and `--env` the bot was started with
     (`BotConfig.config_path`, `env_path`, kept by `load_config` as given):
     `To log in again from a terminal while the bot runs (no restart
-    needed): cd /my-files/TradingBot && .venv/bin/python
-    /my-files/TradingBot/scripts/renew_schwab_token.py --config
+    needed): cd /path/to/TradingBot && .venv/bin/python
+    /path/to/TradingBot/scripts/renew_schwab_token.py --config
     configs/config.top_tier_adaptive.yaml`. An installed package, with no
     scripts folder, says to run the script from a source checkout instead.
     README_LINUX_DEPLOY.md: "Renewing the Schwab login without a restart"
@@ -2234,8 +2234,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - The session archive copies CYCLE_TIMING and POSITION_MARK into
     `events.jsonl` (`_STRUCTURED_PREFIXES`). The existing lines and records
     are unchanged but for the added fields.
-  - Log volume on the archived days (`review_scratch/liveprep/
-    LP3_instrumentation_tools/log_volume.py`: the passes are the quote
+  - Log volume on the archived days (an offline script, not part of
+    this repository: the passes are the quote
     batches inside their span and inferred from the throttled markers
     outside it; the line sizes are the patched code's own, from the real
     loop on 2026-09-24's bars): CYCLE_TIMING about 390 bytes on a full pass
